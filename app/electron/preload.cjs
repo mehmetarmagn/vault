@@ -1,13 +1,21 @@
-// Preload: renderer'a sadece güvenli vault API'sini açar.
+// Preload: exposes only the safe vault API to the renderer.
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('vault', {
   ping: () => ipcRenderer.invoke('vault:ping'),
   status: () => ipcRenderer.invoke('vault:status'),
+  defaultDir: () => ipcRenderer.invoke('vault:default-dir'),
+  exists: (vaultDir) => ipcRenderer.invoke('vault:exists', { vaultDir }),
+  selectDir: () => ipcRenderer.invoke('vault:select-dir'),
+  reveal: (vaultDir) => ipcRenderer.invoke('vault:reveal', { vaultDir }),
   init: (vaultDir, password) => ipcRenderer.invoke('vault:init', { vaultDir, password }),
   unlock: (vaultDir, password) => ipcRenderer.invoke('vault:unlock', { vaultDir, password }),
   list: () => ipcRenderer.invoke('vault:list'),
   importFile: () => ipcRenderer.invoke('vault:import'),
+  importFolder: () => ipcRenderer.invoke('vault:import-folder'),
+  cancelImport: () => ipcRenderer.invoke('vault:cancel-import'),
+  exportFolder: (prefix) => ipcRenderer.invoke('vault:export-folder', { prefix }),
+  deleteFolder: (prefix) => ipcRenderer.invoke('vault:delete-folder', { prefix }),
   open: (fileId) => ipcRenderer.invoke('vault:open', { fileId }),
   reencrypt: (fileId) => ipcRenderer.invoke('vault:reencrypt', { fileId }),
   closeFile: (fileId) => ipcRenderer.invoke('vault:close', { fileId }),

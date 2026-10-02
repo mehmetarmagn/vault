@@ -1,34 +1,35 @@
-# DESIGN.md — Secure Vault görsel kararları
+# DESIGN.md — Secure Vault visual decisions
 
-Bu dosya ürünün tasarım sistemidir. UI üreten herkes (insan/AI) buraya uyar.
+This file is the product's design system. Anyone producing UI (human/AI) follows it.
 
-## Fikir (point of view)
+## Idea (point of view)
 
-Bir banka kasası dairesi gibi hissettirmeli: sessiz, ağır, mekanik. Dekorasyon yok;
-güven veren şey süs değil **hassasiyet**: hizalı sayılar, gerçek durumlar, her
-tıklamada cevap veren arayüz.
+It should feel like a bank vault hall: quiet, heavy, mechanical. No decoration;
+what inspires trust is not ornament but **precision**: aligned numbers, honest
+states, an interface that answers every click.
 
 ## Dials
 
-ENERGY 2 / RHYTHM 2 / MOTION 2 — sıcak karşılama, asimetrik kilit ekranı, overlay
-montaj animasyonları + basma mikro-etkisi + dönen kasa-çarkı motifi. Liste içeriği
-animasyonsuz belirir (içerik varsayılan görünür).
+ENERGY 2 / RHYTHM 2 / MOTION 2 — warm welcome, asymmetric lock screen, overlay
+mount animations + press micro-effect + spinning vault-wheel motif. List content
+appears without animation (content visible by default).
 
-## Jetonlar
+## Tokens
 
-- Zemin: `#14120f` (sıcak koyu), panel `#1c1a16`, saç çizgisi `rgba(255,255,255,.08)`
-- Tek vurgu: kehribar `#e8a33d` — SADECE birincil eylem + "açık dosya" noktası + focus halkası
-- Anlam renkleri: başarı `#4caf7d`, tehlike `#d4573e` (sadece ilgili yerde)
-- YASAK: mor/mavi gradient, cam efektli kart, glow, emoji ikon, her yerde 16px radius
-- Yazı: arayüz `Segoe UI Variable`, marka/boş durum başlığı `Georgia` serif, id/boyut/durum çubuğu `Cascadia Mono, Consolas` mono + tabular sayılar
-- Radius: kontrol 8px, kart 10px. Satır yüksekliği: liste 40px, komut paleti 36px
-- Hareket: sadece 120ms hover/focus geçişleri. Giriş animasyonu YOK (içerik varsayılan görünür).
-  `prefers-reduced-motion` varsa geçişler kapanır.
+- Ground: `#14120f` (warm dark), panel `#1c1a16`, hairline `rgba(255,255,255,.08)`
+- Single accent: amber `#e8a33d` — ONLY primary action + "open file" dot + focus ring
+- Meaning colors: success `#4caf7d`, danger `#d4573e` (only where relevant)
+- FORBIDDEN: purple/blue gradients, glassmorphic cards, glow, emoji icons, 16px radius everywhere
+- Type: UI `Segoe UI Variable`, brand/empty-state headings `Georgia` serif, ids/sizes/status bar `Cascadia Mono, Consolas` mono + tabular numbers
+- Radius: controls 8px, cards 10px. Row heights: list 40px, command palette 36px
+- Motion: soft 150–200ms hover/focus transitions with ease-out curve, press scale .97.
+  No entrance animation (content visible by default).
+  `prefers-reduced-motion` disables transitions.
 
-## Desenler
+## Patterns
 
-- Liste öncelikli: dosyalar tablo satırı (ikon + isim + mono boyut + göreli zaman + hover'da eylemler)
-- Komut paleti (`Ctrl+K`): dosyalar + eylemler, klavye ile gezinme — güç kullanıcılarının omurgası
-- Boş durumlar tasarlanmış: serif başlık + tek cümle + tek eylem butonu
-- Her butonda: default / hover / focus-visible / active / disabled hali
-- Kopya dili kısa ve somut: kategori değil iddia ("10 dk boşta kalınca kilitlenir")
+- List first: files as table rows (icon + name + mono size + relative time + hover actions)
+- Command palette (`Ctrl+K`): files + actions, keyboard navigation — the power-user backbone
+- Designed empty states: serif heading + single sentence + single action button
+- Every button: default / hover / focus-visible / active / disabled states
+- Copy is short and concrete: claims, not categories ("locks after 10 idle minutes")

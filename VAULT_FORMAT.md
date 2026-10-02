@@ -1,13 +1,13 @@
 # Vault Format v2
 
-## Dizin yapısı
+## Directory layout
 
 ```
 <vault-dir>/
   vault.meta.json   // plaintext: version=2, kdf params, salt, verifier
   index.enc         // AES-GCM(JSON index), nonce prepended
   blobs/
-    <random-id>     // VLT2 chunked AES-GCM (diskte plaintext isim YOK)
+    <random-id>     // VLT2 chunked AES-GCM (no plaintext names on disk)
 ```
 
 ## vault.meta.json
@@ -28,21 +28,33 @@
 ```
 "VLT2" || chunkSize u32BE || chunk*:
   chunk = nonce(12) || ctLen u32BE || ct
-  AAD(chunk i) = blobId + 0x00 + i u32BE   (sıra değiştirmeye dayanıklı)
+  AAD(chunk i) = blobId + 0x00 + i u32BE   (reorder-resistant)
 ```
 
-- v1 blob'lar (`nonce||ct`, AAD=blobId) okunabilir (geriye uyumlu), yeni yazımlar hep v2.
-- `Size` alanı index'te **plaintext boyutudur** (kaba bilgi sızıntısı kabulü; v3'te gizlenebilir).
+- v1 blobs (`nonce||ct`, AAD=blobId) stay readable (backward compatible); all new writes are v2.
+- `Size` in the index is the **plaintext** size (accepted coarse leak; may be hidden in v3).
 
-## IPC (stdio JSON-Line) — komutlar
+## IPC (stdio JSON-Line) — commands
 
-`init, unlock, list, status, import, open, reencrypt, close, delete, rename, export, change-password, lock, ping`
+`init, unlock, list, status, exists, import, import-folder, cancel-import, open, reencrypt, close, delete, delete-folder, rename, export, export-folder, change-password, lock, ping`
 
-Go → Electron istenmeyen event'ler (`id: 0`): `auto-reencrypted`, `file-closed`, `reencrypted`.
-Electron bunları `vault:event` ile renderer'a iletir.
+Go → Electron unsolicited events (`id: 0`): `auto-reencrypted`, `file-closed`, `reencrypted`, `import-progress`.
+Electron forwards them to the renderer as `vault:event`.
 
-## Watcher (otomatik geri şifreleme)
+`import-folder` runs in two phases: first `scan`, then `start {total, bytesTotal}`,
+progress while sealing as `progress {done, total, current, bytesDone, bytesTotal}`, finally `done`.
+Single-file `import` reports too when the file is over 8MB (`op: "import"`).
+`export-folder` and `delete-folder` report the same way (`op: "export"` / `"delete"`).
+Requests run concurrently; `cancel-import` stops a running transfer.
 
-`open` → temp decrypt (0600) + 2 sn poll watcher. Temp değişirse otomatik re-encrypt +
-`auto-reencrypted` eventi. Temp silinirse `file-closed`. `lock` tüm temp'leri güvenli siler
-(üzerine sıfır yaz + kaldır).
+## Folders (v2.1)
+
+A folder import seals the tree file by file; `Name` holds the relative path
+(`proj/src/main.go`). Folders are not separate records — entries group by prefix.
+`export-folder` rebuilds the tree on disk, `delete-folder` removes every match.
+
+## Watcher (automatic reseal)
+
+`open` → temp decrypt (0600) + 2s poll watcher. If the temp changes, automatic
+re-encrypt + `auto-reencrypted` event. If the temp is deleted, `file-closed`.
+`lock` wipes all temps securely (zero over + remove).

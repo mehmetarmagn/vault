@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Secure Vault — Logo</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#14120f; color:#f5f5f4; font-family:"Segoe UI Variable","Segoe UI",system-ui,sans-serif; min-height:100vh; display:flex; flex-direction:column; align-items:center; padding:56px 24px 70px; }
+  .hero { display:flex; flex-direction:column; align-items:center; padding:40px 20px 10px; }
+  .word { margin-top:30px; font-family:Georgia,"Times New Roman",serif; font-size:52px; letter-spacing:-.02em; }
+  .sub { margin-top:12px; font-family:"Cascadia Mono",Consolas,monospace; font-size:12px; letter-spacing:.26em; color:#a8a29a; }
+  .opts { margin-top:64px; display:flex; gap:28px; flex-wrap:wrap; justify-content:center; }
+  .o { display:flex; flex-direction:column; align-items:center; gap:10px; }
+  .o .n { font-family:"Cascadia Mono",Consolas,monospace; font-size:11px; color:#a8a29a; }
+  .o .n b { color:#e8a33d; }
+  .sizes { margin-top:44px; display:flex; align-items:flex-end; gap:22px; opacity:.9; }
+  .foot { margin-top:40px; font-size:13px; color:#78716c; }
+  .foot b { color:#e8a33d; }
+</style>
+</head>
+<body>
+
+  <!-- FOTOĞRAF ALANI -->
+  <div class="hero">
+    <svg viewBox="0 0 200 200" style="width:248px;height:248px">
+      <path d="M56 60 L88 128" fill="none" stroke="#f5f5f4" stroke-width="26" stroke-linecap="round"/>
+      <path d="M144 60 L112 128" fill="none" stroke="#f5f5f4" stroke-width="26" stroke-linecap="round"/>
+      <circle cx="100" cy="120" r="13" fill="#e8a33d"/>
+      <rect x="94" y="127" width="12" height="24" rx="6" fill="#e8a33d"/>
+    </svg>
+    <div class="word">Secure Vault</div>
+    <div class="sub">AES-256-GCM · ARGON2ID</div>
+  </div>
+
+  <!-- ALTERNATİFLER -->
+  <div class="opts">
+    <div class="o">
+      <svg viewBox="0 0 200 200" style="width:96px;height:96px">
+        <path d="M56 60 L88 128" fill="none" stroke="#f5f5f4" stroke-width="26" stroke-linecap="round"/>
+        <path d="M144 60 L112 128" fill="none" stroke="#f5f5f4" stroke-width="26" stroke-linecap="round"/>
+        <circle cx="100" cy="120" r="13" fill="#e8a33d"/>
+        <rect x="94" y="127" width="12" height="24" rx="6" fill="#e8a33d"/>
+      </svg>
+      <div class="n"><b>A</b> · V + kilit</div>
+    </div>
+    <div class="o">
+      <svg viewBox="0 0 200 200" style="width:96px;height:96px">
+        <circle cx="100" cy="100" r="50" fill="none" stroke="#f5f5f4" stroke-width="22"/>
+        <g fill="#f5f5f4">
+          <rect x="93" y="30" width="14" height="24" rx="7"/>
+          <rect x="93" y="146" width="14" height="24" rx="7"/>
+          <rect x="30" y="93" width="24" height="14" rx="7"/>
+          <rect x="146" y="93" width="24" height="14" rx="7"/>
+        </g>
+        <circle cx="100" cy="100" r="15" fill="#e8a33d"/>
+      </svg>
+      <div class="n"><b>B</b> · kadran</div>
+    </div>
+    <div class="o">
+      <svg viewBox="0 0 200 200" style="width:96px;height:96px">
+        <path d="M40 74 L100 44 L160 74 L100 104 Z" fill="none" stroke="#f5f5f4" stroke-width="15" stroke-linejoin="round"/>
+        <path d="M40 106 L100 76 L160 106 L100 136 Z" fill="none" stroke="#f5f5f4" stroke-width="15" stroke-linejoin="round" opacity=".6"/>
+        <path d="M40 138 L100 108 L160 138 L100 168 Z" fill="none" stroke="#e8a33d" stroke-width="15" stroke-linejoin="round"/>
+      </svg>
+      <div class="n"><b>C</b> · katman</div>
+    </div>
+  </div>
+
+  <div class="sizes">
+    <svg viewBox="0 0 200 200" style="width:40px;height:40px">
+      <path d="M56 60 L88 128" fill="none" stroke="#f5f5f4" stroke-width="30" stroke-linecap="round"/>
+      <path d="M144 60 L112 128" fill="none" stroke="#f5f5f4" stroke-width="30" stroke-linecap="round"/>
+      <circle cx="100" cy="120" r="15" fill="#e8a33d"/>
+    </svg>
+    <svg viewBox="0 0 200 200" style="width:26px;height:26px">
+      <path d="M56 60 L88 128" fill="none" stroke="#f5f5f4" stroke-width="34" stroke-linecap="round"/>
+      <path d="M144 60 L112 128" fill="none" stroke="#f5f5f4" stroke-width="34" stroke-linecap="round"/>
+      <circle cx="100" cy="120" r="17" fill="#e8a33d"/>
+    </svg>
+    <svg viewBox="0 0 200 200" style="width:16px;height:16px">
+      <path d="M56 60 L88 128" fill="none" stroke="#f5f5f4" stroke-width="38" stroke-linecap="round"/>
+      <path d="M144 60 L112 128" fill="none" stroke="#f5f5f4" stroke-width="38" stroke-linecap="round"/>
+      <circle cx="100" cy="120" r="19" fill="#e8a33d"/>
+    </svg>
+  </div>
+
+  <div class="foot">Beğendiğini söyle — <b>A</b>, <b>B</b> ya da <b>C</b> — uygulamaya gömeyim.</div>
+
+</body>
+</html>

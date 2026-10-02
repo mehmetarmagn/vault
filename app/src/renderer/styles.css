@@ -10,12 +10,12 @@ body {
 }
 ::selection { background: rgba(232, 163, 61, 0.35); }
 
-/* ince koyu kaydırma çubuğu */
+/* slim dark scrollbar */
 *::-webkit-scrollbar { width: 10px; height: 10px; }
 *::-webkit-scrollbar-thumb { background: #3a352c; border-radius: 8px; border: 2px solid #14120f; }
 *::-webkit-scrollbar-track { background: transparent; }
 
-/* tasarlanmış focus halkası — sadece butonlarda; inputlar kapsayıcı üzerinden aydınlanır */
+/* designed focus ring — buttons only; inputs glow through their container */
 :focus { outline: none; }
 button:focus-visible, a:focus-visible, [role="button"]:focus-visible {
   outline: 2px solid #e8a33d; outline-offset: 2px; border-radius: 6px;
@@ -24,27 +24,34 @@ input.no-ring:focus-visible, textarea.no-ring:focus-visible, select.no-ring:focu
   outline: none;
 }
 
-/* mikro-geçişler: sadece hover/active */
-.btn, .rowline, .navitem { transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease; }
-.btn:active { transform: scale(0.98); }
-.rowline .rowactions { transition: opacity 140ms ease; }
+/* micro-transitions: hover/active only, soft ease-out */
+.btn, .rowline, .navitem { transition: background-color 150ms cubic-bezier(.22,.8,.28,1), border-color 150ms cubic-bezier(.22,.8,.28,1), color 150ms cubic-bezier(.22,.8,.28,1), transform 150ms cubic-bezier(.22,.8,.28,1), opacity 150ms ease-out; }
+.btn:active { transform: scale(0.97); }
+.btn:disabled { transition: opacity 150ms ease-out; }
+.rowline .rowactions { transition: opacity 160ms ease-out; }
+input { transition: border-color 150ms cubic-bezier(.22,.8,.28,1); }
 
-/* montaj animasyonları — sadece overlay'lerde (içerik varsayılan görünür kalır) */
+/* overlay entrances only (content appears instantly, no entrance animation) */
 @keyframes pop {
-  from { opacity: 0; transform: translateY(6px) scale(0.985); }
+  from { opacity: 0; transform: translateY(8px) scale(0.982); }
   to { opacity: 1; transform: translateY(0) scale(1); }
 }
 @keyframes toast-in {
-  from { opacity: 0; transform: translateX(12px); }
+  from { opacity: 0; transform: translateX(14px); }
   to { opacity: 1; transform: translateX(0); }
 }
+@keyframes fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
 @keyframes rot { to { transform: rotate(360deg); } }
-.animate-pop { animation: pop 160ms ease-out; }
-.animate-toast { animation: toast-in 180ms ease-out; }
+.animate-pop { animation: pop 180ms cubic-bezier(.22,.8,.28,1); }
+.animate-toast { animation: toast-in 200ms cubic-bezier(.22,.8,.28,1); }
+.animate-fade { animation: fade 160ms ease-out; }
 .spin-slow { animation: rot 18s linear infinite; }
 
 @media (prefers-reduced-motion: reduce) {
-  .btn, .rowline, .navitem, .rowline .rowactions { transition: none; }
+  .btn, .rowline, .navitem, .rowline .rowactions, input { transition: none; }
   .btn:active { transform: none; }
-  .animate-pop, .animate-toast, .spin-slow { animation: none; }
+  .animate-pop, .animate-toast, .animate-fade, .spin-slow { animation: none; }
 }

@@ -12,6 +12,7 @@
     "start": "electron .",
     "dev:electron": "electron .",
     "dist": "npm run build:renderer && electron-builder --win --x64",
+    "dist:portable": "npm run build:renderer && electron-builder --win portable --x64",
     "dist:dir": "npm run build:renderer && electron-builder --win --x64 --dir"
   },
   "dependencies": {
@@ -51,15 +52,24 @@
       }
     ],
     "win": {
+      "icon": "../assets/icon.ico",
       "target": [
-        "nsis"
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
       ],
-      "artifactName": "${productName}-Setup-${version}.${ext}"
+      "artifactName": "${productName}-${version}.${ext}"
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-portable.${ext}"
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
-      "shortcutName": "Secure Vault"
+      "shortcutName": "Secure Vault",
+      "installerIcon": "../assets/icon.ico",
+      "uninstallerIcon": "../assets/icon.ico"
     }
   }
 }

@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, Fragment } from 'react'
+import logoMark from './assets/logo-mark.png'
 import {
-  Archive, ArrowDownToLine, Check, Clock, Command, Download, File, FileText,
-  Film, Fingerprint, FolderOpen, Image, KeyRound, Lock, Music, Pencil,
-  Plus, Search, ShieldCheck, Trash2, Vault, X,
+  Archive, ArrowDownToLine, Check, ChevronDown, ChevronRight, Clock, Command, Download, Eye, EyeOff, File, FileText,
+  Film, Fingerprint, Folder, FolderOpen, FolderPlus, FolderSymlink, Image, KeyRound, Lock, Music, Pencil,
+  Plus, Search, ShieldCheck, Trash2, X,
 } from 'lucide-react'
 
 type FileEntry = {
@@ -14,8 +15,55 @@ type FileEntry = {
   format: number
 }
 
-const DEFAULT_DIR = 'C:/Users/L455C4V/Documents/secure-vault-demo'
+type DirNode = {
+  name: string
+  full: string
+  dirs: DirNode[]
+  files: FileEntry[]
+  totalFiles: number
+  totalSize: number
+}
+
+type TaskProg = {
+  op: string
+  phase: string
+  root: string
+  done: number
+  total: number
+  current: string
+  bytesDone: number
+  bytesTotal: number
+  startedAt: number
+}
+
+function opVerb(op: string) {
+  if (op === 'export') return 'Exporting'
+  if (op === 'delete') return 'Deleting'
+  return 'Encrypting'
+}
+
 const IDLE_LOCK_MS = 10 * 60 * 1000
+
+function friendlyError(e?: string) {
+  if (!e) return 'Unknown error.'
+  if (e === 'invalid-password') return 'Wrong password.'
+  if (e === 'locked') return 'Unlock the vault first.'
+  if (e === 'go-timeout') return 'Core did not answer within 90s.'
+  if (e.includes('Access is denied') || e.includes('permission denied'))
+    return 'Windows denied writing to that folder. Run as a normal user; the vault lives in its automatic location.'
+  if (e.includes('could not create vault folder')) return e
+  return e
+}
+
+function pwScore(pw: string) {
+  let s = 0
+  if (pw.length >= 8) s++
+  if (pw.length >= 12) s++
+  if (/[A-ZĞÜŞİÖÇ]/.test(pw) && /[a-zğüşiöç]/.test(pw)) s++
+  if (/\d/.test(pw)) s++
+  if (/[^A-Za-z0-9ğüşiöçĞÜŞİÖÇ]/.test(pw)) s++
+  return Math.min(s, 4)
+}
 
 function fmtSize(b: number) {
   if (b < 1024) return `${b} B`
@@ -24,12 +72,18 @@ function fmtSize(b: number) {
   return `${(b / 1024 / 1024 / 1024).toFixed(2)} GB`
 }
 
+function fmtDur(sec: number | null) {
+  if (sec === null || !isFinite(sec)) return '—'
+  const s = Math.max(0, Math.round(sec))
+  return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
+}
+
 function relTime(iso: string) {
   const d = Date.now() - new Date(iso).getTime()
-  if (d < 60e3) return 'az önce'
-  if (d < 3600e3) return `${Math.floor(d / 60e3)} dk`
-  if (d < 86400e3) return `${Math.floor(d / 3600e3)} sa`
-  return `${Math.floor(d / 86400e3)} g`
+  if (d < 60e3) return 'just now'
+  if (d < 3600e3) return `${Math.floor(d / 60e3)}m`
+  if (d < 86400e3) return `${Math.floor(d / 3600e3)}h`
+  return `${Math.floor(d / 86400e3)}d`
 }
 
 function fileIcon(f: FileEntry) {
@@ -59,21 +113,28 @@ function matchFilter(f: FileEntry, flt: Filter) {
   return !isImg && !isDoc && !isMedia
 }
 
-/* ------------------------------- uygulama ------------------------------- */
+  /* ------------------------------- app ------------------------------- */
 
 export default function App() {
-  const [vaultDir, setVaultDir] = useState(DEFAULT_DIR)
+  const [vaultDir, setVaultDir] = useState('')
+  const [vaultExists, setVaultExists] = useState<boolean | null>(null)
   const [password, setPassword] = useState('')
+  const [showPw, setShowPw] = useState(false)
   const [locked, setLocked] = useState(true)
   const [busy, setBusy] = useState(false)
-  const [status, setStatus] = useState('Çekirdeğe bağlanılıyor…')
+  const [status, setStatus] = useState('Connecting to core…')
   const [files, setFiles] = useState<FileEntry[]>([])
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<Filter>('all')
   const [sort, setSort] = useState<'date' | 'name' | 'size'>('date')
   const [openIds, setOpenIds] = useState<Set<string>>(new Set())
   const [toasts, setToasts] = useState<{ id: number; msg: string }[]>([])
+  const [importProg, setImportProg] = useState<TaskProg | null>(null)
+  const [cancelling, setCancelling] = useState(false)
+  const [nowTick, setNowTick] = useState(0)
   const [delTarget, setDelTarget] = useState<FileEntry | null>(null)
+  const [folderDelTarget, setFolderDelTarget] = useState<string | null>(null)
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
   const [renTarget, setRenTarget] = useState<FileEntry | null>(null)
   const [renName, setRenName] = useState('')
   const [pwModal, setPwModal] = useState(false)
@@ -92,7 +153,7 @@ export default function App() {
   const refreshList = useCallback(async () => {
     const r = await window.vault.list()
     if (r.ok) setFiles(r.data as FileEntry[])
-    else setStatus('Liste hatası: ' + r.error)
+    else setStatus('List failed: ' + r.error)
   }, [])
 
   const syncOpen = useCallback(async () => {
@@ -103,24 +164,86 @@ export default function App() {
   const doLock = useCallback(async () => {
     await window.vault.lock()
     setLocked(true); setFiles([]); setOpenIds(new Set()); setPassword(''); setPalOpen(false)
-    setStatus('Kilitlendi. Anahtar bellekten silindi.')
+    setStatus('Locked. Key wiped from memory.')
   }, [])
 
   useEffect(() => {
     window.vault.onEvent((d: any) => {
-      if (d?.event === 'auto-reencrypted') { toast('Değişiklik geri şifrelendi'); refreshList(); syncOpen() }
+      if (d?.event === 'auto-reencrypted') { toast('Change sealed back in'); refreshList(); syncOpen() }
       else if (d?.event === 'file-closed') { syncOpen(); refreshList() }
-      else if (d?.event === 'reencrypted') { toast('Dosya kasaya kapatıldı'); refreshList(); syncOpen() }
+      else if (d?.event === 'reencrypted') { toast('File sealed into the vault'); refreshList(); syncOpen() }
+      else if (d?.event === 'import-progress') {
+        const op = (d.op as string) || 'import'
+        const ph = d.phase as string
+        if (ph === 'scan' || ph === 'start') {
+          setCancelling(false)
+          setImportProg((p) => ({
+            op, phase: ph, root: d.root || '',
+            done: 0, total: d.total || 0, current: '',
+            bytesDone: 0, bytesTotal: d.bytesTotal || 0,
+            startedAt: ph === 'scan' || !p || p.op !== op ? Date.now() : p.startedAt,
+          }))
+        } else if (ph === 'progress' || ph === 'done') {
+          setImportProg((p) => p ? {
+            ...p, op, phase: ph,
+            done: d.done ?? p.done, total: d.total ?? p.total,
+            current: d.current ?? '', bytesDone: d.bytesDone ?? p.bytesDone, bytesTotal: d.bytesTotal ?? p.bytesTotal,
+          } : p)
+          if (ph === 'done') { refreshList(); syncOpen() }
+        }
+      }
     })
   }, [refreshList, syncOpen, toast])
 
   useEffect(() => {
-    window.vault.ping().then((r) => {
-      setStatus(r.ok ? 'Hazır.' : 'Çekirdek cevap vermiyor: ' + r.error)
-    })
+    if (!importProg) return
+    const t = window.setInterval(() => setNowTick(Date.now()), 500)
+    return () => window.clearInterval(t)
+  }, [importProg !== null])
+
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      const p = await window.vault.ping()
+      if (cancelled) return
+      if (!p.ok) { setStatus('Core is not responding: ' + friendlyError(p.error)); return }
+      try {
+        const d = await window.vault.defaultDir()
+        const dir = (d.ok && (d.data as any)?.path) ? (d.data as any).path as string : ''
+        if (cancelled) return
+        if (dir) {
+          setVaultDir(dir)
+          const ex = await window.vault.exists(dir)
+          if (cancelled) return
+          const exists = !!(ex.ok && (ex.data as any)?.exists)
+          setVaultExists(exists)
+          setStatus(exists ? 'Ready. Enter your password to open the vault.' : 'No vault yet. Pick a password and it sets itself up.')
+        } else {
+          setStatus('Ready.')
+        }
+      } catch {
+        setStatus('Ready.')
+      }
+    })()
+    return () => { cancelled = true }
   }, [])
 
-  // Ctrl/⌘+K: komut paleti (kilit kapalıyken)
+  async function refreshExists(dir?: string) {
+    const d = dir ?? vaultDir
+    if (!d) return
+    const ex = await window.vault.exists(d)
+    if (ex.ok) setVaultExists(!!(ex.data as any)?.exists)
+  }
+
+  async function pickDir() {
+    const r = await window.vault.selectDir()
+    if (r.ok && (r.data as any)?.path) {
+      setVaultDir((r.data as any).path)
+      await refreshExists((r.data as any).path)
+    }
+  }
+
+  // Ctrl/Cmd+K: command palette (while unlocked)
   useEffect(() => {
     if (locked) return
     const h = (e: KeyboardEvent) => {
@@ -137,7 +260,7 @@ export default function App() {
     if (locked) return
     const reset = () => {
       if (idleTimer.current) window.clearTimeout(idleTimer.current)
-      idleTimer.current = window.setTimeout(() => { toast('10 dk hareketsizlik — kilitlendi'); doLock() }, IDLE_LOCK_MS)
+      idleTimer.current = window.setTimeout(() => { toast('Locked after 10 idle minutes'); doLock() }, IDLE_LOCK_MS)
     }
     reset()
     const evts = ['mousemove', 'keydown', 'click']
@@ -149,58 +272,159 @@ export default function App() {
   }, [locked, doLock, toast])
 
   async function doUnlock() {
-    if (!password) { setStatus('Ana şifre gerekli.'); return }
-    setBusy(true); setStatus('Anahtar türetiliyor…')
+    if (!password) { setStatus('Master password required.'); return }
+    if (!vaultDir) { setStatus('Vault location is warming up, one second.'); return }
+    setBusy(true); setStatus('Deriving key…')
     const r = await window.vault.unlock(vaultDir, password)
     setPassword(''); setBusy(false)
     if (r.ok) {
       setLocked(false)
-      setStatus(`${r.data.files} kayıt çözüldü.`)
+      setStatus(`${r.data.files} entries decrypted.`)
       await refreshList(); await syncOpen()
-    } else setStatus(r.error === 'invalid-password' ? 'Şifre tutmadı.' : 'Açma hatası: ' + r.error)
+    } else setStatus(friendlyError(r.error))
   }
 
   async function doInit() {
-    if (password.length < 8) { setStatus('En az 8 karakterlik bir ana şifre seç.'); return }
-    setBusy(true); setStatus('Kasa kuruluyor…')
+    if (password.length < 8) { setStatus('Pick a master password of at least 8 characters.'); return }
+    if (!vaultDir) { setStatus('Vault location is warming up, one second.'); return }
+    setBusy(true); setStatus('Setting up vault…')
     const r = await window.vault.init(vaultDir, password)
     setPassword(''); setBusy(false)
     if (r.ok) {
-      setLocked(false); setStatus('Kasa kuruldu. Bu şifrenin yedeği yok — unutma.')
+      setLocked(false); setVaultExists(true)
+      setStatus('Vault created. There is no backup of this password — keep it safe.')
       await refreshList(); await syncOpen()
-    } else setStatus('Kurulum hatası: ' + r.error)
+    } else setStatus(friendlyError(r.error))
   }
 
   async function doImport() {
     const r = await window.vault.importFile()
     if (r.ok && !(r.data as any)?.skipped) {
       const n = Array.isArray(r.data) ? (r.data as any[]).filter((x) => x.ok).length : 1
-      toast(`${n} dosya şifrelendi`)
+      toast(`${n} ${n === 1 ? 'file' : 'files'} encrypted`)
       await refreshList()
     }
   }
 
+  async function doImportFolder() {
+    const r = await window.vault.importFolder()
+    setImportProg(null); setCancelling(false)
+    if (r.ok && !(r.data as any)?.skipped) {
+      const d = r.data as any
+      if (d?.cancelled) {
+        toast('Transfer cancelled, received files stay in the vault')
+      } else {
+        const n = Array.isArray(d?.imported) ? d.imported.length : 0
+        const s = Array.isArray(d?.skipped) ? d.skipped.length : 0
+        toast(s > 0 ? `${n} files encrypted (${s} skipped)` : `${n} ${n === 1 ? 'file' : 'files'} encrypted`)
+      }
+      await refreshList()
+    } else if (!r.ok) setStatus('Error: ' + friendlyError(r.error))
+  }
+
+  async function doCancelImport() {
+    setCancelling(true)
+    await window.vault.cancelImport()
+  }
+
+  async function doExportFolder(prefix: string) {
+    const r = await window.vault.exportFolder(prefix)
+    setImportProg(null); setCancelling(false)
+    if (r.ok && !(r.data as any)?.skipped) {
+      const d = r.data as any
+      toast(d?.cancelled ? 'Export cancelled' : `${d?.exported ?? ''} files exported`.trim())
+      await refreshList()
+    } else if (!r.ok) setStatus('Hata: ' + friendlyError(r.error))
+  }
+
+  async function doDeleteFolder() {
+    if (!folderDelTarget) return
+    const r = await window.vault.deleteFolder(folderDelTarget)
+    setImportProg(null); setCancelling(false)
+    if (r.ok) {
+      const d = r.data as any
+      toast(d?.cancelled ? 'Deletion cancelled, removed entries are gone' : 'Folder deleted')
+      setFolderDelTarget(null); await refreshList(); await syncOpen()
+    }     else { setStatus('Delete failed: ' + friendlyError(r.error)); setFolderDelTarget(null) }
+  }
+
+  function toggleGroup(prefix: string) {
+    setCollapsed((s) => { const n = new Set(s); if (n.has(prefix)) n.delete(prefix); else n.add(prefix); return n })
+  }
+
+  const renderDir = (d: DirNode, depth: number) => {
+    const col = collapsed.has(d.full)
+    return (
+      <Fragment key={d.full}>
+        <div className="flex h-10 items-center gap-2 border-b border-line/60 bg-panel2/60 pr-3"
+          style={{ paddingLeft: 12 + depth * 18 }}>
+          <button onClick={() => toggleGroup(d.full)}
+            className="btn flex min-w-0 flex-1 items-center gap-2.5 text-left">
+            {col
+              ? <ChevronRight className="h-3.5 w-3.5 shrink-0 text-stone-500" strokeWidth={1.75} />
+              : <ChevronDown className="h-3.5 w-3.5 shrink-0 text-stone-500" strokeWidth={1.75} />}
+            <Folder className="h-4 w-4 shrink-0 text-brass" strokeWidth={1.75} />
+            <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-stone-100">{d.name}</span>
+                      <span className="shrink-0 font-mono text-[11px] text-stone-500">
+                        {d.totalFiles} {d.totalFiles === 1 ? 'file' : 'files'} · {fmtSize(d.totalSize)}</span>
+          </button>
+          <span className="flex shrink-0 items-center gap-0.5">
+                      <IconBtn title="Export folder" onClick={() => doExportFolder(d.full)}><Download className="h-3.5 w-3.5" strokeWidth={1.75} /></IconBtn>
+                      <IconBtn title="Delete folder" danger onClick={() => setFolderDelTarget(d.full)}><Trash2 className="h-3.5 w-3.5" strokeWidth={1.75} /></IconBtn>
+          </span>
+        </div>
+        {!col && d.dirs.map((c) => renderDir(c, depth + 1))}
+        {!col && d.files.map((f) => renderRow(f, f.name.slice(d.full.length + 1), depth + 1))}
+      </Fragment>
+    )
+  }
+
+  const renderRow = (f: FileEntry, label: string, depth = 0) => {
+    const open = openIds.has(f.id)
+    return (
+      <div key={f.id} onDoubleClick={() => doOpen(f.id)}
+        className="rowline group flex h-10 cursor-default items-center gap-3 border-b border-line/60 bg-panel pr-3 hover:bg-panel2"
+        style={{ paddingLeft: 12 + depth * 18 }}>
+        {fileIcon(f)}
+        <span className="min-w-0 flex-1 truncate text-[13px] text-stone-100" title={f.name}>
+          {label}
+                      {open && <span className="ml-2 inline-block h-1.5 w-1.5 rounded-full bg-brass align-middle" title="Open" />}
+        </span>
+        <span className="hidden font-mono text-[11px] text-stone-500 sm:inline">{f.id.slice(0, 8)}</span>
+        <span className="w-20 text-right font-mono text-[11px] text-fog">{fmtSize(f.size)}</span>
+        <span className="hidden w-14 text-right text-[12px] text-stone-500 md:inline">{relTime(f.mtime)}</span>
+        <span className="rowactions flex items-center gap-0.5 opacity-100 lg:opacity-0 lg:group-hover:opacity-100">
+          <IconBtn title="Open" onClick={() => doOpen(f.id)}><FolderOpen className="h-3.5 w-3.5" strokeWidth={1.75} /></IconBtn>
+          {open && <IconBtn title="Seal back" onClick={() => doReencrypt(f.id)}><Check className="h-3.5 w-3.5" strokeWidth={1.75} /></IconBtn>}
+          <IconBtn title="Export" onClick={() => doExport(f)}><Download className="h-3.5 w-3.5" strokeWidth={1.75} /></IconBtn>
+          <IconBtn title="Rename" onClick={() => { setRenTarget(f); setRenName(f.name) }}><Pencil className="h-3.5 w-3.5" strokeWidth={1.75} /></IconBtn>
+          <IconBtn title="Delete" danger onClick={() => setDelTarget(f)}><Trash2 className="h-3.5 w-3.5" strokeWidth={1.75} /></IconBtn>
+        </span>
+      </div>
+    )
+  }
+
   async function doOpen(id: string) {
-    setStatus('Çözülüyor…')
+    setStatus('Decrypting…')
     const r = await window.vault.open(id)
     if (r.ok) {
       setOpenIds((s) => new Set(s).add(id))
-      setStatus('Dosya açık. Kaydetmen yeterli — gerisini kasa halleder.')
-    } else setStatus('Açma hatası: ' + r.error)
+      setStatus('File is open. Just save — the vault handles the rest.')
+    } else setStatus('Open failed: ' + r.error)
   }
 
   async function doReencrypt(id: string) {
     const r = await window.vault.reencrypt(id)
     if (r.ok) { setOpenIds((s) => { const n = new Set(s); n.delete(id); return n }); await refreshList() }
-    else setStatus('Hata: ' + r.error)
+    else setStatus('Error: ' + r.error)
   }
 
   async function doCloseNoSave(id: string) {
     const r = await window.vault.closeFile(id)
     if (r.ok) {
       setOpenIds((s) => { const n = new Set(s); n.delete(id); return n })
-      toast('Değişiklikler atıldı, kasa aynen duruyor')
-    } else setStatus('Hata: ' + r.error)
+      toast('Changes discarded, vault untouched')
+    } else setStatus('Error: ' + r.error)
   }
 
   async function doDelete() {
@@ -214,23 +438,23 @@ export default function App() {
     if (!renTarget || !renName.trim()) return
     const r = await window.vault.rename(renTarget.id, renName.trim())
     if (r.ok) { setRenTarget(null); setRenName(''); await refreshList() }
-    else setStatus('Hata: ' + r.error)
+    else setStatus('Error: ' + r.error)
   }
 
   async function doExport(f: FileEntry) {
     const r = await window.vault.exportFile(f.id, f.name)
-    if (r.ok && !(r.data as any)?.skipped) toast('Şifresiz kopya dışa aktarıldı')
-    else if (!r.ok) setStatus('Hata: ' + r.error)
+    if (r.ok && !(r.data as any)?.skipped) toast('Decrypted copy exported')
+    else if (!r.ok) setStatus('Error: ' + r.error)
   }
 
   async function doChangePw() {
-    if (newPw.length < 8) { toast('En az 8 karakter olmalı'); return }
-    if (newPw !== newPw2) { toast('İki giriş eşleşmiyor'); return }
+    if (newPw.length < 8) { toast('At least 8 characters'); return }
+    if (newPw !== newPw2) { toast("Passwords don't match"); return }
     setBusy(true)
     const r = await window.vault.changePassword(newPw)
     setBusy(false); setNewPw(''); setNewPw2('')
-    if (r.ok) { setPwModal(false); toast('Ana şifre değişti, kasa baştan mühürlendi') }
-    else toast('Hata: ' + r.error)
+    if (r.ok) { setPwModal(false); toast('Master password changed, vault resealed') }
+    else toast('Error: ' + r.error)
   }
 
   const shown = useMemo(() => files
@@ -250,7 +474,53 @@ export default function App() {
     other: files.filter((f) => matchFilter(f, 'other')).length,
   }), [files])
 
-  /* ------------------------------- kilit ekranı ------------------------------- */
+  // iç içe ağaç: "a/b/c.txt" -> a > b > c.txt (yapı korunur)
+  const tree = useMemo(() => {
+    type M = { dirs: Map<string, M>; files: FileEntry[] }
+    const mk = (): M => ({ dirs: new Map(), files: [] })
+    const root: M = mk()
+    for (const f of shown) {
+      const parts = f.name.split('/')
+      let cur = root
+      for (let i = 0; i < parts.length - 1; i++) {
+        let n = cur.dirs.get(parts[i])
+        if (!n) { n = mk(); cur.dirs.set(parts[i], n) }
+        cur = n
+      }
+      cur.files.push(f)
+    }
+    const visDir = (d: DirNode): boolean => d.files.length > 0 || d.dirs.some(visDir)
+    const conv = (name: string, full: string, m: M): DirNode => {
+      const dirs = [...m.dirs.entries()]
+        .sort((a, b) => a[0].localeCompare(b[0], 'tr'))
+        .map(([n, mm]) => conv(n, full ? `${full}/${n}` : n, mm))
+        .filter(visDir)
+      let tf = m.files.length, ts = 0
+      for (const f of m.files) ts += f.size
+      for (const d of dirs) { tf += d.totalFiles; ts += d.totalSize }
+      return { name, full, dirs, files: m.files, totalFiles: tf, totalSize: ts }
+    }
+    const dirs = [...root.dirs.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0], 'tr'))
+      .map(([n, mm]) => conv(n, n, mm))
+      .filter(visDir)
+    return { rootFiles: root.files, dirs }
+  }, [shown])
+
+  const progStats = useMemo(() => {
+    void nowTick
+    if (!importProg || importProg.phase === 'scan' || !importProg.total) return null
+    const elapsed = Math.max(0.5, (Date.now() - importProg.startedAt) / 1000)
+    const frac = importProg.bytesTotal > 0
+      ? importProg.bytesDone / importProg.bytesTotal
+      : importProg.done / importProg.total
+    const speed = importProg.bytesDone / elapsed
+    const eta = speed > 1 && importProg.bytesTotal > 0
+      ? (importProg.bytesTotal - importProg.bytesDone) / speed : null
+    return { frac: Math.min(1, Math.max(0, frac)), speed, eta, elapsed }
+  }, [importProg, nowTick])
+
+  /* ------------------------------- lock screen ------------------------------- */
   if (locked) {
     return (
       <div className="flex min-h-screen bg-ink">
@@ -258,60 +528,111 @@ export default function App() {
           style={{ backgroundImage: 'linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px)', backgroundSize: '28px 28px' }}>
           <div>
             <div className="flex items-center gap-2.5">
-              <span className="relative grid h-9 w-9 place-items-center">
-                <span className="spin-slow absolute inset-0 rounded-full border border-dashed border-brassdim" />
-                <Vault className="h-4 w-4 text-brass" strokeWidth={1.75} />
-              </span>
+              <img src={logoMark} alt="Secure Vault" className="h-9 w-9 object-contain" />
               <span className="font-display text-xl tracking-tight text-stone-100">Secure Vault</span>
             </div>
             <p className="mt-8 font-display text-[34px] leading-[1.15] tracking-tight text-stone-100">
-              Dosyaların.<br />Kimse okumadan.
+              Your files.<br />No one else's business.
             </p>
             <div className="mt-10 space-y-4 text-[13px]">
               <div className="flex items-start gap-3">
                 <Fingerprint className="mt-0.5 h-4 w-4 shrink-0 text-brass" strokeWidth={1.75} />
-                <div><span className="text-stone-200">Argon2id anahtar türetme</span>
-                  <div className="font-mono text-[11px] text-fog">t=3 · m=64MiB · salt 128-bit</div></div>
+                <div><span className="text-stone-200">Argon2id key derivation</span>
+                  <div className="font-mono text-[11px] text-fog">t=3 · m=64MiB · 128-bit salt</div></div>
               </div>
               <div className="flex items-start gap-3">
                 <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-brass" strokeWidth={1.75} />
-                <div><span className="text-stone-200">AES-256-GCM, isimler dahil</span>
-                  <div className="font-mono text-[11px] text-fog">4MB chunk · AAD zincirli</div></div>
+                <div><span className="text-stone-200">AES-256-GCM, filenames included</span>
+                  <div className="font-mono text-[11px] text-fog">4MB chunks · chained AAD</div></div>
               </div>
               <div className="flex items-start gap-3">
                 <Clock className="mt-0.5 h-4 w-4 shrink-0 text-brass" strokeWidth={1.75} />
-                <div><span className="text-stone-200">10 dk boşta kalınca kilit</span>
-                  <div className="font-mono text-[11px] text-fog">anahtar RAM'den silinir</div></div>
+                <div><span className="text-stone-200">Auto-locks after 10 idle minutes</span>
+                  <div className="font-mono text-[11px] text-fog">key wiped from RAM</div></div>
               </div>
             </div>
           </div>
-          <div className="font-mono text-[11px] text-fog">v1.0.0 · anahtar asla diske yazılmaz</div>
+          <div className="font-mono text-[11px] text-fog">v1.0.0 · the key never touches disk</div>
         </div>
 
         <div className="flex flex-1 items-center justify-center p-6">
           <div className="w-[400px] max-w-full">
-            <h1 className="text-lg font-semibold text-stone-100">Kasayı aç</h1>
-            <p className="mt-1 text-[13px] text-fog">Klasörü seç, ana şifreni gir. Gerisi Go çekirdekte olur.</p>
-            <label className="mt-6 block text-[11px] font-medium uppercase tracking-wider text-fog">Kasa klasörü</label>
-            <div className="mt-1.5 flex items-center gap-2 rounded-lg border border-line bg-panel px-3 focus-within:border-brassdim">
-              <FolderOpen className="h-4 w-4 shrink-0 text-fog" strokeWidth={1.75} />
-              <input value={vaultDir} onChange={(e) => setVaultDir(e.target.value)} spellCheck={false}
-                className="no-ring w-full bg-transparent py-2 text-[13px] text-stone-100 placeholder:text-stone-600" />
+            <div className="flex items-center gap-2">
+              <h1 className="text-lg font-semibold text-stone-100">
+                {vaultExists === false ? 'Create vault' : 'Unlock vault'}
+              </h1>
+              {vaultExists !== null && (
+                <span className={`rounded-full border px-2 py-0.5 font-mono text-[10px] ${vaultExists ? 'border-sage/40 text-sage' : 'border-brassdim/60 text-brass'}`}>
+                  {vaultExists ? 'vault found' : 'first setup'}
+                </span>
+              )}
             </div>
-            <label className="mt-4 block text-[11px] font-medium uppercase tracking-wider text-fog">Ana şifre</label>
+            <p className="mt-1 text-[13px] text-fog">
+              {vaultExists === false
+                ? 'Pick a password and the app handles the rest. No folders to manage.'
+                : 'Enter your password to open the vault. The key only ever lives in memory.'}
+            </p>
+
+            <div className="mt-5 rounded-lg border border-line bg-panel px-3 py-2.5">
+              <div className="flex items-center gap-2">
+                <FolderSymlink className="h-4 w-4 shrink-0 text-fog" strokeWidth={1.75} />
+                <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-stone-300" title={vaultDir || 'warming up…'}>
+                  {vaultDir || 'resolving vault location…'}
+                </span>
+              </div>
+              <div className="mt-2 flex gap-2">
+                <button onClick={() => vaultDir && window.vault.reveal(vaultDir)}
+                  className="btn rounded-md px-2 py-1 text-[12px] text-fog hover:bg-white/5 hover:text-stone-200">
+                  Reveal location</button>
+                <button onClick={pickDir}
+                  className="btn rounded-md px-2 py-1 text-[12px] text-fog hover:bg-white/5 hover:text-stone-200">
+                  Advanced: use another folder</button>
+              </div>
+              <p className="mt-1.5 text-[11px] leading-relaxed text-stone-500">
+                The vault is kept automatically. Export your files anytime to move them elsewhere.
+              </p>
+            </div>
+
+            <label className="mt-4 block text-[11px] font-medium uppercase tracking-wider text-fog">Master password</label>
             <div className="mt-1.5 flex items-center gap-2 rounded-lg border border-line bg-panel px-3 focus-within:border-brassdim">
               <KeyRound className="h-4 w-4 shrink-0 text-fog" strokeWidth={1.75} />
-              <input type="password" value={password} onChange={(e) => setPassword(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') doUnlock() }} placeholder="••••••••"
+              <input type={showPw ? 'text' : 'password'} value={password} onChange={(e) => setPassword(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') vaultExists === false ? doInit() : doUnlock() }} placeholder="••••••••"
                 className="no-ring w-full bg-transparent py-2 text-[13px] text-stone-100 placeholder:text-stone-600" />
+              <button onClick={() => setShowPw((v) => !v)} title={showPw ? 'Hide' : 'Show'}
+                className="btn shrink-0 rounded-md p-1 text-stone-500 hover:text-stone-200">
+                {showPw ? <EyeOff className="h-4 w-4" strokeWidth={1.75} /> : <Eye className="h-4 w-4" strokeWidth={1.75} />}</button>
             </div>
+            {vaultExists === false && password.length > 0 && (
+              <div className="mt-2 flex items-center gap-1.5">
+                {[0, 1, 2, 3].map((i) => (
+                  <span key={i} className={`h-1 flex-1 rounded-full ${i <= pwScore(password) ? 'bg-brass' : 'bg-white/10'}`} />
+                ))}
+                <span className="ml-1 font-mono text-[10px] text-fog">
+                  {pwScore(password) <= 1 ? 'weak' : pwScore(password) === 2 ? 'fair' : 'strong'}</span>
+              </div>
+            )}
             <div className="mt-5 flex gap-2">
-              <button disabled={busy} onClick={doUnlock}
-                className="btn flex-1 rounded-lg bg-brass px-4 py-2 text-[13px] font-semibold text-[#1a1408] hover:bg-[#f0b45a] active:bg-[#d1942f] disabled:opacity-50">
-                {busy ? 'Türetiliyor…' : 'Kilidi aç'}</button>
-              <button disabled={busy} onClick={doInit}
-                className="btn flex-1 rounded-lg border border-line px-4 py-2 text-[13px] font-medium text-stone-300 hover:border-stone-500 disabled:opacity-50">
-                Yeni kasa kur</button>
+              {vaultExists === false ? (
+                <>
+                  <button disabled={busy || !vaultDir} onClick={doInit}
+                    className="btn flex-1 rounded-lg bg-brass px-4 py-2 text-[13px] font-semibold text-[#1a1408] hover:bg-[#f0b45a] active:bg-[#d1942f] disabled:opacity-50">
+                    {busy ? 'Setting up…' : 'Create vault'}</button>
+                  <button disabled={busy} onClick={() => refreshExists()}
+                    className="btn rounded-lg border border-line px-4 py-2 text-[13px] font-medium text-stone-300 hover:border-stone-500 disabled:opacity-50">
+                    Retry</button>
+                </>
+              ) : (
+                <>
+                  <button disabled={busy || !vaultDir} onClick={doUnlock}
+                    className="btn flex-1 rounded-lg bg-brass px-4 py-2 text-[13px] font-semibold text-[#1a1408] hover:bg-[#f0b45a] active:bg-[#d1942f] disabled:opacity-50">
+                    {busy ? 'Deriving…' : 'Unlock'}</button>
+                  <button disabled={busy || !vaultDir} onClick={doInit}
+                    title="Wipes the current vault and starts over"
+                    className="btn flex-1 rounded-lg border border-line px-4 py-2 text-[13px] font-medium text-stone-300 hover:border-stone-500 disabled:opacity-50">
+                    Start over</button>
+                </>
+              )}
             </div>
             <p className="mt-3 min-h-[18px] font-mono text-[11px] text-fog">{status}</p>
           </div>
@@ -320,20 +641,20 @@ export default function App() {
     )
   }
 
-  /* --------------------------------- ana ekran --------------------------------- */
+  /* --------------------------------- main view --------------------------------- */
   const nav: [Filter, string, number][] = [
-    ['all', 'Tümü', counts.all],
-    ['img', 'Görseller', counts.img],
-    ['doc', 'Belgeler', counts.doc],
-    ['media', 'Medya', counts.media],
-    ['other', 'Diğer', counts.other],
+    ['all', 'All', counts.all],
+    ['img', 'Images', counts.img],
+    ['doc', 'Documents', counts.doc],
+    ['media', 'Media', counts.media],
+    ['other', 'Other', counts.other],
   ]
 
   return (
     <div className="flex min-h-screen bg-ink text-stone-200">
       <aside className="hidden w-56 shrink-0 flex-col border-r border-line bg-[#100e0b] py-4 lg:flex">
         <div className="flex items-center gap-2 px-4">
-          <Vault className="h-4 w-4 text-brass" strokeWidth={1.75} />
+          <img src={logoMark} alt="Secure Vault" className="h-5 w-5 object-contain" />
           <span className="font-display text-[15px] tracking-tight text-stone-100">Secure Vault</span>
         </div>
         <nav className="mt-5 space-y-0.5 px-2">
@@ -348,10 +669,10 @@ export default function App() {
         <div className="mt-auto space-y-0.5 px-2">
           <button onClick={() => setPwModal(true)}
             className="navitem flex w-full items-center gap-2 rounded-lg px-2.5 py-[7px] text-[13px] text-fog hover:bg-panel hover:text-stone-200">
-            <KeyRound className="h-3.5 w-3.5" strokeWidth={1.75} /> Şifre değiştir</button>
+            <KeyRound className="h-3.5 w-3.5" strokeWidth={1.75} /> Change password</button>
           <button onClick={doLock}
             className="navitem flex w-full items-center gap-2 rounded-lg px-2.5 py-[7px] text-[13px] text-fog hover:bg-panel hover:text-stone-200">
-            <Lock className="h-3.5 w-3.5" strokeWidth={1.75} /> Kilitle</button>
+            <Lock className="h-3.5 w-3.5" strokeWidth={1.75} /> Lock</button>
         </div>
       </aside>
 
@@ -360,19 +681,22 @@ export default function App() {
           <button onClick={() => setPalOpen(true)}
             className="btn flex h-8 flex-1 items-center gap-2 rounded-lg border border-line bg-panel px-3 text-[13px] text-stone-500 hover:border-stone-600 hover:text-stone-300">
             <Search className="h-3.5 w-3.5" strokeWidth={1.75} />
-            <span>Ara, aç, kilitle…</span>
+            <span>Search, open, lock…</span>
             <kbd className="ml-auto rounded border border-line bg-ink px-1.5 font-mono text-[10px]">Ctrl K</kbd>
           </button>
           <div className="flex items-center rounded-lg border border-line text-[12px]">
             {(['date', 'name', 'size'] as const).map((s) => (
               <button key={s} onClick={() => setSort(s)}
                 className={`btn px-2.5 py-[7px] first:rounded-l-lg last:rounded-r-lg ${sort === s ? 'bg-panel2 text-stone-100' : 'text-fog hover:text-stone-300'}`}>
-                {s === 'date' ? 'Tarih' : s === 'name' ? 'İsim' : 'Boyut'}</button>
+                {s === 'date' ? 'Date' : s === 'name' ? 'Name' : 'Size'}</button>
             ))}
           </div>
+          <button onClick={doImportFolder} title="Encrypt a folder with its tree"
+            className="btn flex h-8 items-center gap-1.5 rounded-lg border border-line px-3 text-[13px] font-medium text-stone-300 hover:border-stone-500 hover:text-stone-100">
+            <FolderPlus className="h-4 w-4" strokeWidth={1.75} /> Folder</button>
           <button onClick={doImport}
             className="btn flex h-8 items-center gap-1.5 rounded-lg bg-brass px-3 text-[13px] font-semibold text-[#1a1408] hover:bg-[#f0b45a] active:bg-[#d1942f]">
-            <Plus className="h-4 w-4" strokeWidth={2} /> Ekle</button>
+            <Plus className="h-4 w-4" strokeWidth={2} /> Add</button>
         </header>
 
         <main className="flex-1 overflow-y-auto px-4 py-3">
@@ -387,51 +711,31 @@ export default function App() {
             <div className="mx-auto mt-24 max-w-[420px] text-center">
               <ArrowDownToLine className="mx-auto h-8 w-8 text-stone-600" strokeWidth={1.25} />
               <p className="mt-4 font-display text-[22px] tracking-tight text-stone-100">
-                {files.length === 0 ? 'Kasa boş, tertemiz.' : 'Burada aradığın yok.'}</p>
+                {files.length === 0 ? 'Vault is empty.' : 'Nothing matches.'}</p>
               <p className="mt-1.5 text-[13px] leading-relaxed text-fog">
                 {files.length === 0
-                  ? 'Ekleye bastığında dosya diske şifreli yazılır — ismi bile okunmaz.'
-                  : 'Farklı bir filtre ya da arama dene.'}</p>
+                  ? 'Hit Add and the file lands on disk encrypted — not even its name stays readable.'
+                  : 'Try another filter or search.'}</p>
               {files.length === 0 && (
                 <button onClick={doImport}
                   className="btn mx-auto mt-5 flex items-center gap-1.5 rounded-lg bg-brass px-4 py-2 text-[13px] font-semibold text-[#1a1408] hover:bg-[#f0b45a]">
-                  <Plus className="h-4 w-4" strokeWidth={2} /> İlk dosyayı şifrele</button>
+                  <Plus className="h-4 w-4" strokeWidth={2} /> Encrypt your first file</button>
               )}
             </div>
           ) : (
             <div className="overflow-hidden rounded-[10px] border border-line">
-              {shown.map((f) => {
-                const open = openIds.has(f.id)
-                return (
-                  <div key={f.id} onDoubleClick={() => doOpen(f.id)}
-                    className="rowline group flex h-10 cursor-default items-center gap-3 border-b border-line/60 bg-panel px-3 last:border-0 hover:bg-panel2">
-                    {fileIcon(f)}
-                    <span className="min-w-0 flex-1 truncate text-[13px] text-stone-100">
-                      {f.name}
-                      {open && <span className="ml-2 inline-block h-1.5 w-1.5 rounded-full bg-brass align-middle" title="Açık" />}
-                    </span>
-                    <span className="hidden font-mono text-[11px] text-stone-500 sm:inline">{f.id.slice(0, 8)}</span>
-                    <span className="w-20 text-right font-mono text-[11px] text-fog">{fmtSize(f.size)}</span>
-                    <span className="hidden w-14 text-right text-[12px] text-stone-500 md:inline">{relTime(f.mtime)}</span>
-                    <span className="rowactions flex items-center gap-0.5 opacity-100 lg:opacity-0 lg:group-hover:opacity-100">
-                      <IconBtn title="Aç" onClick={() => doOpen(f.id)}><FolderOpen className="h-3.5 w-3.5" strokeWidth={1.75} /></IconBtn>
-                      {open && <IconBtn title="Geri şifrele" onClick={() => doReencrypt(f.id)}><Check className="h-3.5 w-3.5" strokeWidth={1.75} /></IconBtn>}
-                      <IconBtn title="Dışa aktar" onClick={() => doExport(f)}><Download className="h-3.5 w-3.5" strokeWidth={1.75} /></IconBtn>
-                      <IconBtn title="Adlandır" onClick={() => { setRenTarget(f); setRenName(f.name) }}><Pencil className="h-3.5 w-3.5" strokeWidth={1.75} /></IconBtn>
-                      <IconBtn title="Sil" danger onClick={() => setDelTarget(f)}><Trash2 className="h-3.5 w-3.5" strokeWidth={1.75} /></IconBtn>
-                    </span>
-                  </div>
-                )
-              })}
-            </div>
+              {tree.dirs.map((d) => renderDir(d, 0))}
+              {tree.rootFiles.map((f) => renderRow(f, f.name, 0))}            </div>
           )}
         </main>
 
         <footer className="flex h-8 shrink-0 items-center gap-4 border-t border-line px-4 font-mono text-[11px] text-stone-500">
           <span className="flex items-center gap-1.5"><ShieldCheck className="h-3 w-3 text-sage" strokeWidth={2} /> AES-256-GCM</span>
-          <span>Argon2id t=3 m=64MiB</span>
-          <span className="hidden sm:inline">anahtar RAM'de · diskte plaintext yok</span>
-          <span className="ml-auto text-fog">{status}</span>
+          <span className="hidden md:inline">Argon2id t=3 m=64MiB</span>
+          <button onClick={() => vaultDir && window.vault.reveal(vaultDir)} title={vaultDir}
+            className="btn hidden max-w-[320px] truncate text-stone-500 hover:text-stone-300 lg:inline">
+            {vaultDir}</button>
+          <span className="ml-auto truncate text-fog">{status}</span>
         </footer>
       </div>
 
@@ -440,9 +744,40 @@ export default function App() {
           files={files} openIds={openIds} onClose={() => setPalOpen(false)}
           onOpen={(id) => { setPalOpen(false); doOpen(id) }}
           onImport={() => { setPalOpen(false); doImport() }}
+          onImportFolder={() => { setPalOpen(false); doImportFolder() }}
           onLock={() => { setPalOpen(false); doLock() }}
           onPw={() => { setPalOpen(false); setPwModal(true) }}
         />
+      )}
+
+      {importProg && (
+        <div className="fixed inset-0 z-40 grid place-items-center bg-black/60 p-4">
+          <div className="animate-pop w-[420px] max-w-full rounded-[10px] border border-line bg-panel p-5">
+            <div className="flex items-center justify-between gap-3">
+              <h3 className="truncate text-[14px] font-semibold text-stone-100">
+                {importProg.phase === 'scan' ? 'Scanning folder…' : `${opVerb(importProg.op)}: ${importProg.root}`}
+              </h3>
+              <span className="shrink-0 font-mono text-[11px] text-brass">
+                {progStats ? `%${Math.floor(progStats.frac * 100)}` : '…'}
+              </span>
+            </div>
+            <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/10">
+              <div className="h-full rounded-full bg-brass transition-[width]" style={{ width: `${Math.floor((progStats?.frac ?? 0) * 100)}%` }} />
+            </div>
+            <div className="mt-3 min-h-[18px] truncate font-mono text-[11px] text-fog" title={importProg.current}>
+              {importProg.phase === 'scan' ? 'counting files, speed and ETA in a second' : (importProg.current || 'finishing…')}
+            </div>
+            <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 font-mono text-[11px] text-stone-500">
+              <span>files <span className="text-stone-300">{importProg.done}/{importProg.total || '…'}</span></span>
+              <span>size <span className="text-stone-300">{fmtSize(importProg.bytesDone)}/{importProg.bytesTotal ? fmtSize(importProg.bytesTotal) : '…'}</span></span>
+              <span>speed <span className="text-stone-300">{progStats ? `${fmtSize(progStats.speed)}/s` : '…'}</span></span>
+              <span>left <span className="text-stone-300">{progStats ? fmtDur(progStats.eta) : '…'}</span> · elapsed {progStats ? fmtDur(progStats.elapsed) : '…'}</span>
+            </div>
+            <button disabled={cancelling} onClick={doCancelImport}
+              className="btn mt-4 w-full rounded-lg border border-line px-4 py-2 text-[13px] text-stone-300 hover:border-stone-500 disabled:opacity-50">
+              {cancelling ? 'Cancelling…' : 'Cancel (keeps what is done)'}</button>
+          </div>
+        </div>
       )}
 
       <div className="fixed bottom-10 right-4 z-50 flex flex-col gap-2">
@@ -452,40 +787,50 @@ export default function App() {
         ))}
       </div>
 
-      {delTarget && (
-        <Modal title="Kaydı sil?" onClose={() => setDelTarget(null)}>
-          <p className="break-all font-mono text-[12px] text-fog">{delTarget.name}</p>
-          <p className="mt-1 text-[13px] text-fog">Diskteki şifreli blok üzerine yazılarak yok edilir. Geri dönüşü yok.</p>
+      {folderDelTarget && (
+        <Modal title="Delete folder?" onClose={() => setFolderDelTarget(null)}>
+          <p className="break-all font-mono text-[12px] text-fog">{folderDelTarget}/…</p>
+          <p className="mt-1 text-[13px] text-fog">Every entry under this prefix goes with its encrypted blocks. No way back.</p>
           <div className="mt-4 flex gap-2">
-            <button onClick={doDelete} className="btn flex-1 rounded-lg bg-rust px-4 py-2 text-[13px] font-semibold text-white hover:brightness-110">Sil</button>
-            <button onClick={() => setDelTarget(null)} className="btn flex-1 rounded-lg border border-line px-4 py-2 text-[13px]">Vazgeç</button>
+            <button onClick={doDeleteFolder} className="btn flex-1 rounded-lg bg-rust px-4 py-2 text-[13px] font-semibold text-white hover:brightness-110">Delete</button>
+            <button onClick={() => setFolderDelTarget(null)} className="btn flex-1 rounded-lg border border-line px-4 py-2 text-[13px]">Cancel</button>
+          </div>
+        </Modal>
+      )}
+      {delTarget && (
+        <Modal title="Delete entry?" onClose={() => setDelTarget(null)}>
+          <p className="break-all font-mono text-[12px] text-fog">{delTarget.name}</p>
+          <p className="mt-1 text-[13px] text-fog">The encrypted block is overwritten on disk. No way back.</p>
+          <div className="mt-4 flex gap-2">
+            <button onClick={doDelete} className="btn flex-1 rounded-lg bg-rust px-4 py-2 text-[13px] font-semibold text-white hover:brightness-110">Delete</button>
+            <button onClick={() => setDelTarget(null)} className="btn flex-1 rounded-lg border border-line px-4 py-2 text-[13px]">Cancel</button>
           </div>
         </Modal>
       )}
 
       {renTarget && (
-        <Modal title="Yeniden adlandır" onClose={() => setRenTarget(null)}>
+        <Modal title="Rename" onClose={() => setRenTarget(null)}>
           <input value={renName} onChange={(e) => setRenName(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter') doRename() }} autoFocus spellCheck={false}
             className="no-ring mt-1 w-full rounded-lg border border-line bg-ink px-3 py-2 text-[13px] focus:border-brassdim" />
           <div className="mt-4 flex gap-2">
-            <button onClick={doRename} className="btn flex-1 rounded-lg bg-brass px-4 py-2 text-[13px] font-semibold text-[#1a1408] hover:bg-[#f0b45a]">Kaydet</button>
-            <button onClick={() => setRenTarget(null)} className="btn flex-1 rounded-lg border border-line px-4 py-2 text-[13px]">Vazgeç</button>
+            <button onClick={doRename} className="btn flex-1 rounded-lg bg-brass px-4 py-2 text-[13px] font-semibold text-[#1a1408] hover:bg-[#f0b45a]">Save</button>
+            <button onClick={() => setRenTarget(null)} className="btn flex-1 rounded-lg border border-line px-4 py-2 text-[13px]">Cancel</button>
           </div>
         </Modal>
       )}
 
       {pwModal && (
-        <Modal title="Ana şifreyi değiştir" onClose={() => { setPwModal(false); setNewPw(''); setNewPw2('') }}>
-          <p className="text-[13px] text-fog">Kasadaki her kayıt yeni anahtarla baştan mühürlenir. Biraz sürer.</p>
-          <input type="password" value={newPw} onChange={(e) => setNewPw(e.target.value)} placeholder="Yeni şifre"
+        <Modal title="Change master password" onClose={() => { setPwModal(false); setNewPw(''); setNewPw2('') }}>
+          <p className="text-[13px] text-fog">Every entry gets resealed with the new key. Takes a moment.</p>
+          <input type="password" value={newPw} onChange={(e) => setNewPw(e.target.value)} placeholder="New password"
             className="no-ring mt-3 w-full rounded-lg border border-line bg-ink px-3 py-2 text-[13px] focus:border-brassdim" />
-          <input type="password" value={newPw2} onChange={(e) => setNewPw2(e.target.value)} placeholder="Tekrar"
+          <input type="password" value={newPw2} onChange={(e) => setNewPw2(e.target.value)} placeholder="Repeat"
             onKeyDown={(e) => { if (e.key === 'Enter') doChangePw() }}
             className="no-ring mt-2 w-full rounded-lg border border-line bg-ink px-3 py-2 text-[13px] focus:border-brassdim" />
           <div className="mt-4 flex gap-2">
-            <button disabled={busy} onClick={doChangePw} className="btn flex-1 rounded-lg bg-brass px-4 py-2 text-[13px] font-semibold text-[#1a1408] hover:bg-[#f0b45a] disabled:opacity-50">Değiştir</button>
-            <button onClick={() => { setPwModal(false); setNewPw(''); setNewPw2('') }} className="btn flex-1 rounded-lg border border-line px-4 py-2 text-[13px]">Vazgeç</button>
+            <button disabled={busy} onClick={doChangePw} className="btn flex-1 rounded-lg bg-brass px-4 py-2 text-[13px] font-semibold text-[#1a1408] hover:bg-[#f0b45a] disabled:opacity-50">Change</button>
+            <button onClick={() => { setPwModal(false); setNewPw(''); setNewPw2('') }} className="btn flex-1 rounded-lg border border-line px-4 py-2 text-[13px]">Cancel</button>
           </div>
         </Modal>
       )}
@@ -493,7 +838,7 @@ export default function App() {
   )
 }
 
-/* ------------------------------ küçük parçalar ------------------------------ */
+/* ------------------------------ small pieces ------------------------------ */
 
 function IconBtn({ children, title, onClick, danger }: { children: React.ReactNode; title: string; onClick: () => void; danger?: boolean }) {
   return (
@@ -518,9 +863,9 @@ function Modal({ title, children, onClose }: { title: string; children: React.Re
   )
 }
 
-function Palette({ files, openIds, onClose, onOpen, onImport, onLock, onPw }: {
+function Palette({ files, openIds, onClose, onOpen, onImport, onImportFolder, onLock, onPw }: {
   files: FileEntry[]; openIds: Set<string>; onClose: () => void
-  onOpen: (id: string) => void; onImport: () => void; onLock: () => void; onPw: () => void
+  onOpen: (id: string) => void; onImport: () => void; onImportFolder: () => void; onLock: () => void; onPw: () => void
 }) {
   const [q, setQ] = useState('')
   const [sel, setSel] = useState(0)
@@ -530,10 +875,11 @@ function Palette({ files, openIds, onClose, onOpen, onImport, onLock, onPw }: {
   const fz = q.toLowerCase()
   const matched = files.filter((f) => f.name.toLowerCase().includes(fz)).slice(0, 6)
   const actions = [
-    { label: 'Dosya ekle', hint: 'şifrele', run: onImport },
-    { label: 'Ana şifreyi değiştir', hint: 'kasayı baştan mühürle', run: onPw },
-    { label: 'Kasayı kilitle', hint: 'anahtarı bellekten sil', run: onLock },
-  ].filter((a) => a.label.toLocaleLowerCase('tr').includes(fz))
+    { label: 'Add files', hint: 'encrypt', run: onImport },
+    { label: 'Add folder', hint: 'encrypt the tree', run: onImportFolder },
+    { label: 'Change master password', hint: 'reseal the vault', run: onPw },
+    { label: 'Lock vault', hint: 'wipe key from memory', run: onLock },
+  ].filter((a) => a.label.toLocaleLowerCase('en').includes(fz))
   const total = matched.length + actions.length
 
   useEffect(() => { setSel(0) }, [q])
@@ -557,12 +903,12 @@ function Palette({ files, openIds, onClose, onOpen, onImport, onLock, onPw }: {
       <div className="animate-pop mx-auto w-[560px] max-w-full overflow-hidden rounded-[10px] border border-line bg-panel shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center gap-2 border-b border-line px-3.5 transition-colors focus-within:border-brassdim">
           <Command className="h-4 w-4 shrink-0 text-fog" strokeWidth={1.75} />
-          <input ref={inputRef} value={q} onChange={(e) => setQ(e.target.value)} placeholder="Dosya, eylem…"
+          <input ref={inputRef} value={q} onChange={(e) => setQ(e.target.value)} placeholder="Files, actions…"
             spellCheck={false} className="no-ring w-full bg-transparent py-2.5 text-[13px] placeholder:text-stone-600" />
           <kbd className="rounded border border-line px-1.5 font-mono text-[10px] text-stone-500">esc</kbd>
         </div>
         <div className="max-h-[320px] overflow-y-auto p-1.5">
-          {matched.length > 0 && <div className="px-2 pb-1 pt-1.5 text-[11px] font-medium uppercase tracking-wider text-stone-500">Dosyalar</div>}
+          {matched.length > 0 && <div className="px-2 pb-1 pt-1.5 text-[11px] font-medium uppercase tracking-wider text-stone-500">Files</div>}
           {matched.map((f) => {
             idx++
             const i = idx
@@ -576,7 +922,7 @@ function Palette({ files, openIds, onClose, onOpen, onImport, onLock, onPw }: {
               </button>
             )
           })}
-          {actions.length > 0 && <div className="px-2 pb-1 pt-2 text-[11px] font-medium uppercase tracking-wider text-stone-500">Eylemler</div>}
+          {actions.length > 0 && <div className="px-2 pb-1 pt-2 text-[11px] font-medium uppercase tracking-wider text-stone-500">Actions</div>}
           {actions.map((a) => {
             idx++
             const i = idx
@@ -588,12 +934,13 @@ function Palette({ files, openIds, onClose, onOpen, onImport, onLock, onPw }: {
               </button>
             )
           })}
-          {total === 0 && <div className="px-3 py-6 text-center text-[13px] text-stone-500">Eşleşen bir şey yok.</div>}
+          {total === 0 && <div className="px-3 py-6 text-center text-[13px] text-stone-500">No matches.</div>}
         </div>
         <div className="flex items-center gap-3 border-t border-line px-3.5 py-2 font-mono text-[10px] text-stone-500">
-          <span>↑↓ gez</span><span>↵ çalıştır</span><span className="ml-auto">{total} sonuç</span>
+          <span>↑↓ navigate</span><span>↵ run</span><span className="ml-auto">{total} results</span>
         </div>
       </div>
     </div>
   )
 }
+

@@ -1,5 +1,5 @@
-// vault-core v2: chunked AES-256-GCM + CRUD + otomatik geri şifreleme (watcher).
-// IPC: stdin/stdout JSON-Line. Key sadece bu process RAM'inde.
+// vault-core v2: chunked AES-256-GCM + CRUD + automatic reseal (watcher).
+// IPC: stdin/stdout JSON-Line. Key lives only in this process's RAM.
 package main
 
 import (
@@ -15,7 +15,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/argon2"
@@ -42,12 +44,13 @@ type Request struct {
 	DestPath    string `json:"destPath,omitempty"`
 	Name        string `json:"name,omitempty"`
 	FileID      string `json:"fileId,omitempty"`
+	Prefix      string `json:"prefix,omitempty"`
 }
 
 type Response struct {
-	ID    int `json:"id"`
-	OK    bool `json:"ok"`
-	Data  any `json:"data,omitempty"`
+	ID    int    `json:"id"`
+	OK    bool   `json:"ok"`
+	Data  any    `json:"data,omitempty"`
 	Error string `json:"error,omitempty"`
 }
 
@@ -105,6 +108,9 @@ type session struct {
 
 var sess = session{open: map[string]*openInfo{}}
 
+// folder-import cancel flag (set by cancel-import)
+var importCancel atomic.Bool
+
 var stdoutMu sync.Mutex
 
 func emit(v any) {
@@ -114,7 +120,7 @@ func emit(v any) {
 	_ = enc.Encode(v)
 }
 
-func fail(id int, msg string) { emit(Response{ID: id, OK: false, Error: msg}) }
+func fail(id int, msg string)  { emit(Response{ID: id, OK: false, Error: msg}) }
 func succeed(id int, data any) { emit(Response{ID: id, OK: true, Data: data}) }
 func sendEvent(name string, payload map[string]any) {
 	payload["event"] = name
@@ -193,8 +199,12 @@ func aadForChunk(blobID string, idx uint32) []byte {
 	return buf.Bytes()
 }
 
-// encryptFileChunked: VLT2 header + chunklar. Her chunk: nonce(12) + ctLen(4BE) + ct.
+// encryptFileChunked: VLT2 header + chunks. Each chunk: nonce(12) + ctLen(4BE) + ct.
 func encryptFileChunked(key, plaintext []byte, blobID string) ([]byte, error) {
+	return encryptFileChunkedProg(key, plaintext, blobID, nil)
+}
+
+func encryptFileChunkedProg(key, plaintext []byte, blobID string, prog func(done, total int)) ([]byte, error) {
 	aead, err := aeadFor(key)
 	if err != nil {
 		return nil, err
@@ -230,6 +240,9 @@ func encryptFileChunked(key, plaintext []byte, blobID string) ([]byte, error) {
 		binary.BigEndian.PutUint32(lb[:], uint32(len(ct)))
 		out.Write(lb[:])
 		out.Write(ct)
+		if prog != nil {
+			prog(i+1, n)
+		}
 		if len(plaintext) == 0 {
 			break
 		}
@@ -279,7 +292,7 @@ func decryptChunked(key, raw []byte, blobID string) ([]byte, error) {
 		off += int(ctLen)
 		pt, err := aead.Open(nil, nonce, ct, aadForChunk(blobID, idx))
 		if err != nil {
-			return nil, fmt.Errorf("chunk %d decrypt başarısız", idx)
+			return nil, fmt.Errorf("chunk %d decryption failed", idx)
 		}
 		out.Write(pt)
 		zeroBytes(pt)
@@ -328,14 +341,36 @@ func readIndexLocked() error {
 	return json.Unmarshal(plain, &sess.index)
 }
 
-func secureWipe(path string) {
-	if f, err := os.OpenFile(path, os.O_WRONLY, 0600); err == nil {
-		if st, err := f.Stat(); err == nil && st.Size() > 0 {
-			_, _ = f.WriteAt(make([]byte, st.Size()), 0)
-			_ = f.Sync()
-		}
-		_ = f.Close()
+// zero over in small pieces (no RAM blowup on big files) + fsync
+func wipeFileContents(path string) {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0600)
+	if err != nil {
+		return
 	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.Size() <= 0 {
+		return
+	}
+	chunk := make([]byte, 1024*1024)
+	var off int64
+	remaining := st.Size()
+	for remaining > 0 {
+		n := int64(len(chunk))
+		if n > remaining {
+			n = remaining
+		}
+		if _, err := f.WriteAt(chunk[:n], off); err != nil {
+			break
+		}
+		off += n
+		remaining -= n
+	}
+	_ = f.Sync()
+}
+
+func secureWipe(path string) {
+	wipeFileContents(path)
 	_ = os.Remove(path)
 }
 
@@ -350,7 +385,7 @@ func guessMime(name string) string {
 		return "image/gif"
 	case ".pdf":
 		return "application/pdf"
-	case ".txt", ".md":
+	case ".txt", ".md", ".go", ".js", ".ts", ".tsx", ".json", ".html", ".css", ".rs", ".py", ".yml", ".yaml", ".toml", ".log":
 		return "text/plain"
 	case ".mp4":
 		return "video/mp4"
@@ -363,7 +398,7 @@ func guessMime(name string) string {
 	}
 }
 
-// ---------- watcher: temp değişince otomatik geri şifrele ----------
+// ---------- watcher: reseal automatically when the temp file changes ----------
 
 func startWatcher(fileID string) {
 	sess.Lock()
@@ -395,7 +430,7 @@ func startWatcher(fileID string) {
 
 				data, err := os.ReadFile(tmp)
 				if err != nil {
-					// temp silinmiş = kullanıcı kapattı, watcher'ı bitir (blob zaten şifreli duruyor)
+					// temp deleted = user closed it, stop the watcher (blob stays sealed)
 					sess.Lock()
 					if o, ok := sess.open[fileID]; ok && o.tempPath == tmp {
 						close(o.stopCh)
@@ -409,8 +444,9 @@ func startWatcher(fileID string) {
 				if h == oi.lastHash {
 					continue
 				}
-				// değişmiş → otomatik geri şifrele
+				// changed → reseal automatically
 				sess.Lock()
+				plainLen := int64(len(data))
 				enc, err := encryptFileChunked(sess.key, data, fileID)
 				zeroBytes(data)
 				if err != nil {
@@ -418,13 +454,15 @@ func startWatcher(fileID string) {
 					continue
 				}
 				_ = os.WriteFile(blobPath(sess.vaultDir, fileID), enc, 0600)
+				nowISO := time.Now().UTC().Format(time.RFC3339)
 				for i := range sess.index.Files {
 					if sess.index.Files[i].ID == fileID {
-						sess.index.Files[i].Size = int64(len(enc))
+						sess.index.Files[i].Size = plainLen
+						sess.index.Files[i].Mtime = nowISO
 					}
 				}
 				_ = writeIndexLocked()
-				// yeni hash'i güncelle
+				// refresh the stored hash
 				if cur, err := os.ReadFile(tmp); err == nil {
 					oi.lastHash = sha256.Sum256(cur)
 				}
@@ -454,15 +492,15 @@ func handleInit(req Request) {
 	sess.Lock()
 	defer sess.Unlock()
 	if req.VaultDir == "" || req.Password == "" {
-		fail(req.ID, "vaultDir ve password gerekli")
+		fail(req.ID, "vaultDir and password required")
 		return
 	}
 	if err := os.MkdirAll(filepath.Join(req.VaultDir, "blobs"), 0700); err != nil {
-		fail(req.ID, err.Error())
+		fail(req.ID, "could not create vault folder: "+err.Error())
 		return
 	}
 	if _, err := os.Stat(metaPath(req.VaultDir)); err == nil {
-		fail(req.ID, "vault zaten var, unlock kullanın")
+		fail(req.ID, "vault already exists, use unlock")
 		return
 	}
 	kdf, err := defaultKDF()
@@ -507,17 +545,17 @@ func handleUnlock(req Request) {
 	sess.Lock()
 	defer sess.Unlock()
 	if req.VaultDir == "" || req.Password == "" {
-		fail(req.ID, "vaultDir ve password gerekli")
+		fail(req.ID, "vaultDir and password required")
 		return
 	}
 	metaBytes, err := os.ReadFile(metaPath(req.VaultDir))
 	if err != nil {
-		fail(req.ID, "vault bulunamadı, önce init edin")
+		fail(req.ID, "vault not found, init first")
 		return
 	}
 	var meta Meta
 	if err := json.Unmarshal(metaBytes, &meta); err != nil {
-		fail(req.ID, "meta bozuk")
+		fail(req.ID, "corrupt meta")
 		return
 	}
 	key, err := deriveKey(req.Password, meta.KDF)
@@ -542,7 +580,7 @@ func handleUnlock(req Request) {
 	if err := readIndexLocked(); err != nil {
 		zeroBytes(key)
 		sess.unlocked = false
-		fail(req.ID, "index çözülemedi: "+err.Error())
+		fail(req.ID, "could not decrypt index: "+err.Error())
 		return
 	}
 	succeed(req.ID, map[string]any{"vaultId": meta.VaultID, "files": len(sess.index.Files)})
@@ -568,6 +606,18 @@ func handleStatus(req Request) {
 	succeed(req.ID, map[string]any{"unlocked": sess.unlocked, "files": len(sess.index.Files), "open": openIDs})
 }
 
+func handleExists(req Request) {
+	if req.VaultDir == "" {
+		fail(req.ID, "vaultDir required")
+		return
+	}
+	if _, err := os.Stat(metaPath(req.VaultDir)); err == nil {
+		succeed(req.ID, map[string]bool{"exists": true})
+		return
+	}
+	succeed(req.ID, map[string]bool{"exists": false})
+}
+
 func handleImport(req Request) {
 	sess.Lock()
 	defer sess.Unlock()
@@ -576,7 +626,7 @@ func handleImport(req Request) {
 		return
 	}
 	if req.Path == "" {
-		fail(req.ID, "path gerekli")
+		fail(req.ID, "path required")
 		return
 	}
 	st, err := os.Stat(req.Path)
@@ -585,7 +635,7 @@ func handleImport(req Request) {
 		return
 	}
 	if st.Size() > MaxFileSize {
-		fail(req.ID, "dosya çok büyük (limit 500MB)")
+		fail(req.ID, "file too large (500MB limit)")
 		return
 	}
 	data, err := os.ReadFile(req.Path)
@@ -594,9 +644,37 @@ func handleImport(req Request) {
 		return
 	}
 	id := newID()
-	enc, err := encryptFileChunked(sess.key, data, id)
+	// report progress per chunk on big files (8MB+)
+	big := len(data) > 8*1024*1024
+	if big {
+		sendEvent("import-progress", map[string]any{
+			"op": "import", "phase": "start", "root": filepath.Base(req.Path),
+			"total": 1, "bytesTotal": int64(len(data)),
+		})
+	}
+	lastEmit := time.Now()
+	enc, err := encryptFileChunkedProg(sess.key, data, id, func(done, total int) {
+		if !big || time.Since(lastEmit) < 150*time.Millisecond {
+			return
+		}
+		lastEmit = time.Now()
+		frac := float64(done) / float64(total)
+		sendEvent("import-progress", map[string]any{
+			"op": "import", "phase": "progress", "root": filepath.Base(req.Path),
+			"done": done, "total": total, "current": filepath.Base(req.Path),
+			"bytesDone": int64(frac * float64(len(data))), "bytesTotal": int64(len(data)),
+		})
+	})
 	plainSize := int64(len(data))
 	zeroBytes(data)
+	if big {
+		sendEvent("import-progress", map[string]any{
+			"op": "import", "phase": "done", "root": filepath.Base(req.Path),
+			"done": 1, "total": 1,
+			"bytesDone": plainSize, "bytesTotal": plainSize,
+			"cancelled": false,
+		})
+	}
 	if err != nil {
 		fail(req.ID, err.Error())
 		return
@@ -619,8 +697,375 @@ func handleImport(req Request) {
 	succeed(req.ID, entry)
 }
 
+const (
+	MaxFolderFiles = 2000
+)
+
+// folder prefix match: "proj" == name or name starts with "proj/..."
+func matchPrefix(name, prefix string) bool {
+	if prefix == "" {
+		return false
+	}
+	return name == prefix || strings.HasPrefix(name, prefix+"/")
+}
+
+func handleImportFolder(req Request) {
+	sess.Lock()
+	defer sess.Unlock()
+	if !sess.unlocked {
+		fail(req.ID, "locked")
+		return
+	}
+	if req.Path == "" {
+		fail(req.ID, "path required")
+		return
+	}
+	st, err := os.Stat(req.Path)
+	if err != nil {
+		fail(req.ID, err.Error())
+		return
+	}
+	if !st.IsDir() {
+		fail(req.ID, "not a folder, use import for files")
+		return
+	}
+	root := req.Path
+	base := filepath.Base(root)
+	importCancel.Store(false)
+	sendEvent("import-progress", map[string]any{"op": "import", "phase": "scan", "root": base})
+
+	// phase 1: scan, build the job list (lock released — disk reads only)
+	type job struct {
+		path  string
+		name  string
+		mime  string
+		mtime string
+		size  int64
+	}
+	sess.Unlock()
+	var jobs []job
+	var skipped []map[string]string
+	truncated := false
+	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, werr error) error {
+		if werr != nil {
+			skipped = append(skipped, map[string]string{"path": p, "reason": werr.Error()})
+			return nil
+		}
+		if d.IsDir() || !d.Type().IsRegular() {
+			return nil
+		}
+		if len(jobs) >= MaxFolderFiles {
+			truncated = true
+			return filepath.SkipAll
+		}
+		info, err := d.Info()
+		if err != nil {
+			skipped = append(skipped, map[string]string{"path": p, "reason": err.Error()})
+			return nil
+		}
+		if info.Size() > MaxFileSize {
+			skipped = append(skipped, map[string]string{"path": p, "reason": "file too large (500MB limit)"})
+			return nil
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			skipped = append(skipped, map[string]string{"path": p, "reason": err.Error()})
+			return nil
+		}
+		name := filepath.ToSlash(filepath.Join(base, rel))
+		jobs = append(jobs, job{
+			path: p, name: name, mime: guessMime(p),
+			mtime: info.ModTime().UTC().Format(time.RFC3339), size: info.Size(),
+		})
+		return nil
+	})
+	sess.Lock()
+	if truncated {
+		skipped = append(skipped, map[string]string{"path": root, "reason": "folder limit exceeded (2000 files)"})
+	}
+	if !sess.unlocked {
+		fail(req.ID, "locked")
+		return
+	}
+	var bytesTotal int64
+	for _, j := range jobs {
+		bytesTotal += j.size
+	}
+	total := len(jobs)
+	if total == 0 {
+		reason := "no importable files in folder"
+		if len(skipped) > 0 {
+			reason = skipped[0]["reason"]
+		}
+		fail(req.ID, "nothing imported: "+reason)
+		return
+	}
+	sendEvent("import-progress", map[string]any{
+		"op": "import", "phase": "start", "root": base, "total": total, "bytesTotal": bytesTotal,
+	})
+
+	// phase 2: encrypt + write (progress in a low voice)
+	taken := map[string]bool{}
+	for _, f := range sess.index.Files {
+		taken[f.Name] = true
+	}
+	unique := func(name string) string {
+		if !taken[name] {
+			taken[name] = true
+			return name
+		}
+		ext := filepath.Ext(name)
+		stem := strings.TrimSuffix(name, ext)
+		for i := 2; ; i++ {
+			cand := fmt.Sprintf("%s (%d)%s", stem, i, ext)
+			if !taken[cand] {
+				taken[cand] = true
+				return cand
+			}
+		}
+	}
+	var imported []FileEntry
+	var bytesDone int64
+	cancelled := false
+	lastEmit := time.Now()
+	emitProg := func(force bool, cur string) {
+		if !force && time.Since(lastEmit) < 150*time.Millisecond {
+			return
+		}
+		lastEmit = time.Now()
+		sendEvent("import-progress", map[string]any{
+			"op": "import", "phase": "progress", "root": base,
+			"done": len(imported), "total": total,
+			"current": cur, "bytesDone": bytesDone, "bytesTotal": bytesTotal,
+		})
+	}
+	for _, j := range jobs {
+		if importCancel.Load() {
+			cancelled = true
+			break
+		}
+		data, err := os.ReadFile(j.path)
+		if err != nil {
+			skipped = append(skipped, map[string]string{"path": j.path, "reason": err.Error()})
+			continue
+		}
+		name := unique(j.name)
+		id := newID()
+		enc, err := encryptFileChunked(sess.key, data, id)
+		plainSize := int64(len(data))
+		zeroBytes(data)
+		if err != nil {
+			skipped = append(skipped, map[string]string{"path": j.path, "reason": err.Error()})
+			continue
+		}
+		if err := os.WriteFile(blobPath(sess.vaultDir, id), enc, 0600); err != nil {
+			skipped = append(skipped, map[string]string{"path": j.path, "reason": err.Error()})
+			continue
+		}
+		imported = append(imported, FileEntry{
+			ID: id, Name: name,
+			Size: plainSize, Mime: j.mime,
+			Mtime:  j.mtime,
+			Format: 2,
+		})
+		bytesDone += j.size
+		emitProg(false, name)
+	}
+	// commit to the index in one go
+	sess.index.Files = append(sess.index.Files, imported...)
+	if err := writeIndexLocked(); err != nil {
+		fail(req.ID, err.Error())
+		return
+	}
+	emitProg(true, "")
+	sendEvent("import-progress", map[string]any{
+		"op": "import", "phase": "done", "root": base,
+		"done": len(imported), "total": total,
+		"bytesDone": bytesDone, "bytesTotal": bytesTotal,
+		"cancelled": cancelled,
+	})
+	succeed(req.ID, map[string]any{"imported": imported, "skipped": skipped, "cancelled": cancelled})
+}
+
+func handleCancelImport(req Request) {
+	importCancel.Store(true)
+	succeed(req.ID, map[string]bool{"cancelling": true})
+}
+
+func handleExportFolder(req Request) {
+	sess.Lock()
+	defer sess.Unlock()
+	if !sess.unlocked {
+		fail(req.ID, "locked")
+		return
+	}
+	if req.Prefix == "" || req.DestPath == "" {
+		fail(req.ID, "prefix and destPath required")
+		return
+	}
+	type target struct {
+		id, name, rel string
+		size          int64
+	}
+	var targets []target
+	var bytesTotal int64
+	for _, f := range sess.index.Files {
+		if !matchPrefix(f.Name, req.Prefix) {
+			continue
+		}
+		rel := strings.TrimPrefix(f.Name, req.Prefix)
+		rel = strings.TrimPrefix(rel, "/")
+		if rel == "" {
+			continue
+		}
+		targets = append(targets, target{id: f.ID, name: f.Name, rel: rel, size: f.Size})
+		bytesTotal += f.Size
+	}
+	if len(targets) == 0 {
+		fail(req.ID, "folder not found")
+		return
+	}
+	importCancel.Store(false)
+	total := len(targets)
+	sendEvent("import-progress", map[string]any{
+		"op": "export", "phase": "start", "root": req.Prefix,
+		"total": total, "bytesTotal": bytesTotal,
+	})
+	n := 0
+	var bytesDone int64
+	cancelled := false
+	lastEmit := time.Now()
+	for _, t := range targets {
+		if importCancel.Load() {
+			cancelled = true
+			break
+		}
+		raw, err := os.ReadFile(blobPath(sess.vaultDir, t.id))
+		if err != nil {
+			fail(req.ID, "could not read blob: "+t.name)
+			return
+		}
+		plain, err := decryptBlobToPlain(sess.key, raw, t.id)
+		if err != nil {
+			fail(req.ID, "decryption failed: "+t.name)
+			return
+		}
+		out := filepath.Join(req.DestPath, filepath.FromSlash(t.rel))
+		if err := os.MkdirAll(filepath.Dir(out), 0700); err != nil {
+			zeroBytes(plain)
+			fail(req.ID, err.Error())
+			return
+		}
+		if err := os.WriteFile(out, plain, 0600); err != nil {
+			zeroBytes(plain)
+			fail(req.ID, err.Error())
+			return
+		}
+		zeroBytes(plain)
+		n++
+		bytesDone += t.size
+		if time.Since(lastEmit) > 150*time.Millisecond {
+			lastEmit = time.Now()
+			sendEvent("import-progress", map[string]any{
+				"op": "export", "phase": "progress", "root": req.Prefix,
+				"done": n, "total": total, "current": t.name,
+				"bytesDone": bytesDone, "bytesTotal": bytesTotal,
+			})
+		}
+	}
+	sendEvent("import-progress", map[string]any{
+		"op": "export", "phase": "done", "root": req.Prefix,
+		"done": n, "total": total,
+		"bytesDone": bytesDone, "bytesTotal": bytesTotal,
+		"cancelled": cancelled,
+	})
+	succeed(req.ID, map[string]any{"exported": n, "destPath": req.DestPath, "cancelled": cancelled})
+}
+
+func handleDeleteFolder(req Request) {
+	sess.Lock()
+	defer sess.Unlock()
+	if !sess.unlocked {
+		fail(req.ID, "locked")
+		return
+	}
+	if req.Prefix == "" {
+		fail(req.ID, "prefix required")
+		return
+	}
+	type target struct {
+		id, name string
+		size    int64
+	}
+	var targets []target
+	var bytesTotal int64
+	for _, f := range sess.index.Files {
+		if matchPrefix(f.Name, req.Prefix) {
+			targets = append(targets, target{id: f.ID, name: f.Name, size: f.Size})
+			bytesTotal += f.Size
+		}
+	}
+	if len(targets) == 0 {
+		fail(req.ID, "folder not found")
+		return
+	}
+	importCancel.Store(false)
+	total := len(targets)
+	sendEvent("import-progress", map[string]any{
+		"op": "delete", "phase": "start", "root": req.Prefix,
+		"total": total, "bytesTotal": bytesTotal,
+	})
+	gone := map[string]bool{}
+	var bytesDone int64
+	cancelled := false
+	lastEmit := time.Now()
+	for _, t := range targets {
+		if importCancel.Load() {
+			cancelled = true
+			break
+		}
+		if o, ok := sess.open[t.id]; ok {
+			select {
+			case <-o.stopCh:
+			default:
+				close(o.stopCh)
+			}
+			secureWipe(o.tempPath)
+			delete(sess.open, t.id)
+		}
+		bp := blobPath(sess.vaultDir, t.id)
+		wipeFileContents(bp)
+		_ = os.Remove(bp)
+		gone[t.id] = true
+		bytesDone += t.size
+		if time.Since(lastEmit) > 150*time.Millisecond {
+			lastEmit = time.Now()
+			sendEvent("import-progress", map[string]any{
+				"op": "delete", "phase": "progress", "root": req.Prefix,
+				"done": len(gone), "total": total, "current": t.name,
+				"bytesDone": bytesDone, "bytesTotal": bytesTotal,
+			})
+		}
+	}
+	kept := sess.index.Files[:0]
+	for _, f := range sess.index.Files {
+		if !gone[f.ID] {
+			kept = append(kept, f)
+		}
+	}
+	sess.index.Files = kept
+	_ = writeIndexLocked()
+	sendEvent("import-progress", map[string]any{
+		"op": "delete", "phase": "done", "root": req.Prefix,
+		"done": len(gone), "total": total,
+		"bytesDone": bytesDone, "bytesTotal": bytesTotal,
+		"cancelled": cancelled,
+	})
+	succeed(req.ID, map[string]any{"deleted": len(gone), "cancelled": cancelled})
+}
+
 func handleOpen(req Request) {
-	// hızlı yol: zaten açıksa mevcut temp'i dön
+	// fast path: already open, return the existing temp
 	sess.Lock()
 	if !sess.unlocked {
 		sess.Unlock()
@@ -642,7 +1087,7 @@ func handleOpen(req Request) {
 	}
 	if entry == nil {
 		sess.Unlock()
-		fail(req.ID, "dosya bulunamadı")
+		fail(req.ID, "file not found")
 		return
 	}
 	raw, err := os.ReadFile(blobPath(sess.vaultDir, entry.ID))
@@ -654,7 +1099,7 @@ func handleOpen(req Request) {
 	plain, err := decryptBlobToPlain(sess.key, raw, entry.ID)
 	if err != nil {
 		sess.Unlock()
-		fail(req.ID, "decrypt başarısız")
+		fail(req.ID, "decryption failed")
 		return
 	}
 	tmp, err := os.CreateTemp("", "vault-"+entry.ID+"-*"+filepath.Ext(entry.Name))
@@ -693,7 +1138,7 @@ func handleReencrypt(req Request) {
 	oi, ok := sess.open[fileID]
 	if !ok {
 		sess.Unlock()
-		fail(req.ID, "açık dosya yok (zaten şifreli)")
+		fail(req.ID, "no open file (already sealed)")
 		return
 	}
 	tmp := oi.tempPath
@@ -709,6 +1154,7 @@ func handleReencrypt(req Request) {
 		fail(req.ID, err.Error())
 		return
 	}
+	plainLen := int64(len(data))
 	enc, err := encryptFileChunked(sess.key, data, fileID)
 	zeroBytes(data)
 	if err != nil {
@@ -717,9 +1163,11 @@ func handleReencrypt(req Request) {
 		return
 	}
 	_ = os.WriteFile(blobPath(sess.vaultDir, fileID), enc, 0600)
+	nowISO := time.Now().UTC().Format(time.RFC3339)
 	for i := range sess.index.Files {
 		if sess.index.Files[i].ID == fileID {
-			sess.index.Files[i].Size = int64(len(enc))
+			sess.index.Files[i].Size = plainLen
+			sess.index.Files[i].Mtime = nowISO
 		}
 	}
 	_ = writeIndexLocked()
@@ -730,12 +1178,12 @@ func handleReencrypt(req Request) {
 }
 
 func handleClose(req Request) {
-	// kaydetmeden kapat: temp'i sil, blob'u aynen bırak
+	// close without saving: drop the temp, leave the blob as is
 	sess.Lock()
 	oi, ok := sess.open[req.FileID]
 	if !ok {
 		sess.Unlock()
-		fail(req.ID, "açık dosya yok")
+		fail(req.ID, "no open file")
 		return
 	}
 	select {
@@ -767,14 +1215,9 @@ func handleDelete(req Request) {
 		secureWipe(o.tempPath)
 		delete(sess.open, req.FileID)
 	}
-	// blob'u üzerine yazarak sil
+	// wipe the blob by overwriting
 	bp := blobPath(sess.vaultDir, req.FileID)
-	if st, err := os.Stat(bp); err == nil && st.Size() > 0 {
-		if f, err := os.OpenFile(bp, os.O_WRONLY, 0600); err == nil {
-			_, _ = f.WriteAt(make([]byte, st.Size()), 0)
-			_ = f.Close()
-		}
-	}
+	wipeFileContents(bp)
 	_ = os.Remove(bp)
 	kept := sess.index.Files[:0]
 	for _, f := range sess.index.Files {
@@ -795,7 +1238,7 @@ func handleRename(req Request) {
 		return
 	}
 	if req.Name == "" {
-		fail(req.ID, "yeni isim gerekli")
+		fail(req.ID, "new name required")
 		return
 	}
 	for i := range sess.index.Files {
@@ -807,7 +1250,7 @@ func handleRename(req Request) {
 			return
 		}
 	}
-	fail(req.ID, "dosya bulunamadı")
+	fail(req.ID, "file not found")
 }
 
 func handleExport(req Request) {
@@ -818,7 +1261,7 @@ func handleExport(req Request) {
 		return
 	}
 	if req.DestPath == "" {
-		fail(req.ID, "destPath gerekli")
+		fail(req.ID, "destPath required")
 		return
 	}
 	found := false
@@ -829,7 +1272,7 @@ func handleExport(req Request) {
 		}
 	}
 	if !found {
-		fail(req.ID, "dosya bulunamadı")
+		fail(req.ID, "file not found")
 		return
 	}
 	raw, err := os.ReadFile(blobPath(sess.vaultDir, req.FileID))
@@ -839,7 +1282,7 @@ func handleExport(req Request) {
 	}
 	plain, err := decryptBlobToPlain(sess.key, raw, req.FileID)
 	if err != nil {
-		fail(req.ID, "decrypt başarısız")
+		fail(req.ID, "decryption failed")
 		return
 	}
 	defer zeroBytes(plain)
@@ -858,7 +1301,7 @@ func handleChangePassword(req Request) {
 		return
 	}
 	if req.NewPassword == "" || len(req.NewPassword) < 8 {
-		fail(req.ID, "yeni şifre en az 8 karakter olmalı")
+		fail(req.ID, "new password must be at least 8 characters")
 		return
 	}
 	newKDF, err := defaultKDF()
@@ -871,18 +1314,18 @@ func handleChangePassword(req Request) {
 		fail(req.ID, err.Error())
 		return
 	}
-	// tüm blob'ları eski key ile çöz, yeni key ile şifrele
+	// decrypt every blob with the old key, seal with the new one
 	for _, f := range sess.index.Files {
 		raw, err := os.ReadFile(blobPath(sess.vaultDir, f.ID))
 		if err != nil {
 			zeroBytes(newKey)
-			fail(req.ID, "blob okunamadı: "+f.Name)
+			fail(req.ID, "could not read blob: "+f.Name)
 			return
 		}
 		plain, err := decryptBlobToPlain(sess.key, raw, f.ID)
 		if err != nil {
 			zeroBytes(newKey)
-			fail(req.ID, "decrypt başarısız: "+f.Name)
+			fail(req.ID, "decryption failed: "+f.Name)
 			return
 		}
 		enc, err := encryptFileChunked(newKey, plain, f.ID)
@@ -894,7 +1337,7 @@ func handleChangePassword(req Request) {
 		}
 		_ = os.WriteFile(blobPath(sess.vaultDir, f.ID), enc, 0600)
 	}
-	// meta'yı güncelle
+	// update the meta
 	metaBytes, _ := os.ReadFile(metaPath(sess.vaultDir))
 	var meta Meta
 	_ = json.Unmarshal(metaBytes, &meta)
@@ -943,45 +1386,68 @@ func handleLock(req Request) {
 func serve() {
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1024*1024), 64*1024*1024)
+	var wg sync.WaitGroup
 	for scanner.Scan() {
 		line := append([]byte(nil), scanner.Bytes()...)
 		var req Request
 		if err := json.Unmarshal(line, &req); err != nil {
 			continue
 		}
-		switch req.Cmd {
-		case "init":
-			handleInit(req)
-		case "unlock":
-			handleUnlock(req)
-		case "list":
-			handleList(req)
-		case "status":
-			handleStatus(req)
-		case "import":
-			handleImport(req)
-		case "open":
-			handleOpen(req)
-		case "reencrypt":
-			handleReencrypt(req)
-		case "close":
-			handleClose(req)
-		case "delete":
-			handleDelete(req)
-		case "rename":
-			handleRename(req)
-		case "export":
-			handleExport(req)
-		case "change-password":
-			handleChangePassword(req)
-		case "lock":
-			handleLock(req)
-		case "ping":
-			succeed(req.ID, map[string]string{"pong": "ok"})
-		default:
-			fail(req.ID, "bilinmeyen komut: "+req.Cmd)
-		}
+		// run each request on its own goroutine so a long import
+		// never blocks cancel-import / status.
+		// shared state is guarded by sess.Lock + stdoutMu.
+		wg.Add(1)
+		go func(r Request) {
+			defer wg.Done()
+			dispatch(r)
+		}(req)
 		zeroBytes(line)
+	}
+	wg.Wait()
+}
+
+func dispatch(req Request) {
+	switch req.Cmd {
+	case "init":
+		handleInit(req)
+	case "unlock":
+		handleUnlock(req)
+	case "list":
+		handleList(req)
+	case "status":
+		handleStatus(req)
+	case "exists":
+		handleExists(req)
+	case "import":
+		handleImport(req)
+	case "import-folder":
+		handleImportFolder(req)
+	case "cancel-import":
+		handleCancelImport(req)
+	case "open":
+		handleOpen(req)
+	case "reencrypt":
+		handleReencrypt(req)
+	case "close":
+		handleClose(req)
+	case "delete":
+		handleDelete(req)
+	case "delete-folder":
+		handleDeleteFolder(req)
+	case "rename":
+		handleRename(req)
+	case "export":
+		handleExport(req)
+	case "export-folder":
+		handleExportFolder(req)
+	case "change-password":
+		handleChangePassword(req)
+	case "lock":
+		handleLock(req)
+	case "ping":
+		succeed(req.ID, map[string]string{"pong": "ok"})
+	default:
+		fail(req.ID, "unknown command: "+req.Cmd)
 	}
 }
 
@@ -990,5 +1456,5 @@ func main() {
 		serve()
 		return
 	}
-	fmt.Println("kullanım: vault-core serve   (stdin/stdout JSON-Line IPC)")
+	fmt.Println("usage: vault-core serve   (stdin/stdout JSON-Line IPC)")
 }
