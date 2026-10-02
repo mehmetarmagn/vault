@@ -1,0 +1,65 @@
+{
+  "name": "secure-vault-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Encrypted secure vault — Electron + React + Go core",
+  "author": "Secure Vault",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "vite",
+    "build:renderer": "vite build",
+    "typecheck": "tsc --noEmit",
+    "start": "electron .",
+    "dev:electron": "electron .",
+    "dist": "npm run build:renderer && electron-builder --win --x64",
+    "dist:dir": "npm run build:renderer && electron-builder --win --x64 --dir"
+  },
+  "dependencies": {
+    "lucide-react": "^1.49.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.6.1",
+    "electron": "^32.0.0",
+    "electron-builder": "^26.15.3",
+    "postcss": "^8.5.28",
+    "tailwindcss": "^3.4.19",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.8"
+  },
+  "build": {
+    "appId": "com.securevault.app",
+    "productName": "Secure Vault",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json",
+      "!dist/win-unpacked/**",
+      "!node_modules/lucide-react/**"
+    ],
+    "extraResources": [
+      {
+        "from": "../vault-core/vault-core.exe",
+        "to": "vault-core.exe"
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "artifactName": "${productName}-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "Secure Vault"
+    }
+  }
+}

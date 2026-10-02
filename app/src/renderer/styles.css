@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { color-scheme: dark; }
+body {
+  @apply bg-ink text-stone-200;
+  font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  font-feature-settings: "tnum" 1;
+}
+::selection { background: rgba(232, 163, 61, 0.35); }
+
+/* ince koyu kaydırma çubuğu */
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-thumb { background: #3a352c; border-radius: 8px; border: 2px solid #14120f; }
+*::-webkit-scrollbar-track { background: transparent; }
+
+/* tasarlanmış focus halkası — sadece butonlarda; inputlar kapsayıcı üzerinden aydınlanır */
+:focus { outline: none; }
+button:focus-visible, a:focus-visible, [role="button"]:focus-visible {
+  outline: 2px solid #e8a33d; outline-offset: 2px; border-radius: 6px;
+}
+input.no-ring:focus-visible, textarea.no-ring:focus-visible, select.no-ring:focus-visible {
+  outline: none;
+}
+
+/* mikro-geçişler: sadece hover/active */
+.btn, .rowline, .navitem { transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease; }
+.btn:active { transform: scale(0.98); }
+.rowline .rowactions { transition: opacity 140ms ease; }
+
+/* montaj animasyonları — sadece overlay'lerde (içerik varsayılan görünür kalır) */
+@keyframes pop {
+  from { opacity: 0; transform: translateY(6px) scale(0.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(12px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes rot { to { transform: rotate(360deg); } }
+.animate-pop { animation: pop 160ms ease-out; }
+.animate-toast { animation: toast-in 180ms ease-out; }
+.spin-slow { animation: rot 18s linear infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .btn, .rowline, .navitem, .rowline .rowactions { transition: none; }
+  .btn:active { transform: none; }
+  .animate-pop, .animate-toast, .spin-slow { animation: none; }
+}

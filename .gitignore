@@ -1,0 +1,29 @@
+# bağımlılıklar
+node_modules/
+
+# build çıktıları
+app/dist/
+app/release/
+dist/
+release/
+
+# derlenen ikililer (yerelde üretilir, README'deki adımlarla)
+*.exe
+*.blockmap
+builder-debug.yml
+
+# Go önbelleği
+vault-core/vault-core
+
+# kullanıcı kasaları ve test artıkları — ASLA commitlenmez
+secure-vault-demo/
+*.vault/
+vault-test/
+vault-v2/
+
+# OS / editör
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
