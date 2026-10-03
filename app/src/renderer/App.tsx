@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState, Fragment } from 'react'
 import logoMark from './assets/logo-mark.png'
+import PreviewModal, { canPreview } from './Preview'
+import LanModal from './LanPanel'
 import {
   Archive, ArrowDownToLine, Check, ChevronDown, ChevronRight, Clock, Command, Download, Eye, EyeOff, File, FileText,
   Film, Fingerprint, Folder, FolderOpen, FolderPlus, FolderSymlink, Image, KeyRound, Lock, Music, Pencil,
-  Plus, Search, ShieldCheck, Trash2, X,
+  Plus, Search, ShieldCheck, Smartphone, Trash2, X,
 } from 'lucide-react'
 
 type FileEntry = {
@@ -137,6 +139,23 @@ export default function App() {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
   const [renTarget, setRenTarget] = useState<FileEntry | null>(null)
   const [renName, setRenName] = useState('')
+  const [previewFile, setPreviewFile] = useState<FileEntry | null>(null)
+  const [lanOpen, setLanOpen] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+  const [deletingFolder, setDeletingFolder] = useState(false)
+  const [importReport, setImportReport] = useState<{
+    imported: number; skipped: { path: string; reason: string }[]; skippedExtra: number
+    emptyDirs: string[]; emptyExtra: number
+  } | null>(null)
+  const [pendingImport, setPendingImport] = useState<{
+    root: string; total: number; bytesTotal: number
+    skipped: { path: string; reason: string }[]; skippedExtra: number
+    emptyDirs: string[]; emptyExtra: number
+  } | null>(null)
+  const [confirming, setConfirming] = useState(false)
+
+  const LARGE_FOLDER_FILES = 2000
+  const LARGE_FOLDER_BYTES = 2 * 1024 * 1024 * 1024
   const [pwModal, setPwModal] = useState(false)
   const [newPw, setNewPw] = useState('')
   const [newPw2, setNewPw2] = useState('')
@@ -307,19 +326,52 @@ export default function App() {
   }
 
   async function doImportFolder() {
-    const r = await window.vault.importFolder()
+    setImportProg({
+      op: 'import', phase: 'scan', root: '…', done: 0, total: 0, current: '',
+      bytesDone: 0, bytesTotal: 0, startedAt: Date.now(),
+    })
+    const r = await window.vault.importFolder() // folder picker + scan
+    if ((r.data as any)?.skipped) { setImportProg(null); return }
+    if (!r.ok) { setImportProg(null); setStatus('Error: ' + friendlyError(r.error)); return }
+    const d = r.data as any
+    const big = (d?.total ?? 0) > LARGE_FOLDER_FILES || (d?.bytesTotal ?? 0) > LARGE_FOLDER_BYTES
+    if (!big) {
+      await runImportConfirm()
+    } else {
+      setImportProg(null)
+      setPendingImport({
+        root: d?.root ?? '', total: d?.total ?? 0, bytesTotal: d?.bytesTotal ?? 0,
+        skipped: Array.isArray(d?.skipped) ? d.skipped : [], skippedExtra: d?.skippedExtra ?? 0,
+        emptyDirs: Array.isArray(d?.emptyDirs) ? d.emptyDirs : [], emptyExtra: d?.emptyExtra ?? 0,
+      })
+    }
+  }
+
+  async function runImportConfirm() {
+    setPendingImport(null)
+    setConfirming(true)
+    const r = await window.vault.confirmImportFolder()
+    setConfirming(false)
     setImportProg(null); setCancelling(false)
-    if (r.ok && !(r.data as any)?.skipped) {
+    if (r.ok) {
       const d = r.data as any
       if (d?.cancelled) {
         toast('Transfer cancelled, received files stay in the vault')
       } else {
         const n = Array.isArray(d?.imported) ? d.imported.length : 0
-        const s = Array.isArray(d?.skipped) ? d.skipped.length : 0
-        toast(s > 0 ? `${n} files encrypted (${s} skipped)` : `${n} ${n === 1 ? 'file' : 'files'} encrypted`)
+        const s = Array.isArray(d?.skipped) ? d.skipped : []
+        const e = Array.isArray(d?.emptyDirs) ? d.emptyDirs : []
+        if (s.length === 0 && (d?.skippedExtra ?? 0) === 0 && e.length === 0 && (d?.emptyExtra ?? 0) === 0) {
+          toast(`${n} ${n === 1 ? 'file' : 'files'} encrypted`)
+        } else {
+          setImportReport({
+            imported: n, skipped: s, skippedExtra: d?.skippedExtra ?? 0,
+            emptyDirs: e, emptyExtra: d?.emptyExtra ?? 0,
+          })
+        }
       }
       await refreshList()
-    } else if (!r.ok) setStatus('Error: ' + friendlyError(r.error))
+    } else setStatus('Error: ' + friendlyError(r.error))
   }
 
   async function doCancelImport() {
@@ -334,16 +386,19 @@ export default function App() {
       const d = r.data as any
       toast(d?.cancelled ? 'Export cancelled' : `${d?.exported ?? ''} files exported`.trim())
       await refreshList()
-    } else if (!r.ok) setStatus('Hata: ' + friendlyError(r.error))
+    } else if (!r.ok) setStatus('Error: ' + friendlyError(r.error))
   }
 
   async function doDeleteFolder() {
-    if (!folderDelTarget) return
+    if (!folderDelTarget || deletingFolder) return
+    setDeletingFolder(true)
     const r = await window.vault.deleteFolder(folderDelTarget)
+    setDeletingFolder(false)
     setImportProg(null); setCancelling(false)
     if (r.ok) {
       const d = r.data as any
-      toast(d?.cancelled ? 'Deletion cancelled, removed entries are gone' : 'Folder deleted')
+      toast((d as any)?.note === 'already gone' ? 'Folder was already gone'
+        : d?.cancelled ? 'Deletion cancelled, removed entries are gone' : 'Folder deleted')
       setFolderDelTarget(null); await refreshList(); await syncOpen()
     }     else { setStatus('Delete failed: ' + friendlyError(r.error)); setFolderDelTarget(null) }
   }
@@ -394,6 +449,7 @@ export default function App() {
         <span className="w-20 text-right font-mono text-[11px] text-fog">{fmtSize(f.size)}</span>
         <span className="hidden w-14 text-right text-[12px] text-stone-500 md:inline">{relTime(f.mtime)}</span>
         <span className="rowactions flex items-center gap-0.5 opacity-100 lg:opacity-0 lg:group-hover:opacity-100">
+          {canPreview(f) && <IconBtn title="Preview inside the vault" onClick={() => setPreviewFile(f)}><Eye className="h-3.5 w-3.5" strokeWidth={1.75} /></IconBtn>}
           <IconBtn title="Open" onClick={() => doOpen(f.id)}><FolderOpen className="h-3.5 w-3.5" strokeWidth={1.75} /></IconBtn>
           {open && <IconBtn title="Seal back" onClick={() => doReencrypt(f.id)}><Check className="h-3.5 w-3.5" strokeWidth={1.75} /></IconBtn>}
           <IconBtn title="Export" onClick={() => doExport(f)}><Download className="h-3.5 w-3.5" strokeWidth={1.75} /></IconBtn>
@@ -428,10 +484,14 @@ export default function App() {
   }
 
   async function doDelete() {
-    if (!delTarget) return
+    if (!delTarget || deleting) return
+    setDeleting(true)
     const r = await window.vault.remove(delTarget.id)
-    if (r.ok) { toast('Kayıt silindi'); setDelTarget(null); await refreshList(); await syncOpen() }
-    else { setStatus('Silme hatası: ' + r.error); setDelTarget(null) }
+    setDeleting(false)
+    if (r.ok) {
+      toast((r.data as any)?.note === 'already gone' ? 'Entry was already gone' : 'Entry deleted')
+      setDelTarget(null); await refreshList(); await syncOpen()
+    } else { setStatus('Delete failed: ' + friendlyError(r.error)); setDelTarget(null) }
   }
 
   async function doRename() {
@@ -667,6 +727,9 @@ export default function App() {
           ))}
         </nav>
         <div className="mt-auto space-y-0.5 px-2">
+          <button onClick={() => setLanOpen(true)}
+            className="navitem flex w-full items-center gap-2 rounded-lg px-2.5 py-[7px] text-[13px] text-fog hover:bg-panel hover:text-stone-200">
+            <Smartphone className="h-3.5 w-3.5" strokeWidth={1.75} /> Phone access</button>
           <button onClick={() => setPwModal(true)}
             className="navitem flex w-full items-center gap-2 rounded-lg px-2.5 py-[7px] text-[13px] text-fog hover:bg-panel hover:text-stone-200">
             <KeyRound className="h-3.5 w-3.5" strokeWidth={1.75} /> Change password</button>
@@ -747,6 +810,7 @@ export default function App() {
           onImportFolder={() => { setPalOpen(false); doImportFolder() }}
           onLock={() => { setPalOpen(false); doLock() }}
           onPw={() => { setPalOpen(false); setPwModal(true) }}
+          onLan={() => { setPalOpen(false); setLanOpen(true) }}
         />
       )}
 
@@ -788,22 +852,73 @@ export default function App() {
       </div>
 
       {folderDelTarget && (
-        <Modal title="Delete folder?" onClose={() => setFolderDelTarget(null)}>
+        <Modal title="Delete folder?" onClose={() => { if (!deletingFolder) setFolderDelTarget(null) }}>
           <p className="break-all font-mono text-[12px] text-fog">{folderDelTarget}/…</p>
           <p className="mt-1 text-[13px] text-fog">Every entry under this prefix goes with its encrypted blocks. No way back.</p>
           <div className="mt-4 flex gap-2">
-            <button onClick={doDeleteFolder} className="btn flex-1 rounded-lg bg-rust px-4 py-2 text-[13px] font-semibold text-white hover:brightness-110">Delete</button>
-            <button onClick={() => setFolderDelTarget(null)} className="btn flex-1 rounded-lg border border-line px-4 py-2 text-[13px]">Cancel</button>
+            <button disabled={deletingFolder} onClick={doDeleteFolder} className="btn flex-1 rounded-lg bg-rust px-4 py-2 text-[13px] font-semibold text-white hover:brightness-110 disabled:opacity-50">{deletingFolder ? 'Deleting…' : 'Delete'}</button>
+            <button disabled={deletingFolder} onClick={() => setFolderDelTarget(null)} className="btn flex-1 rounded-lg border border-line px-4 py-2 text-[13px] disabled:opacity-50">Cancel</button>
           </div>
         </Modal>
       )}
       {delTarget && (
-        <Modal title="Delete entry?" onClose={() => setDelTarget(null)}>
+        <Modal title="Delete entry?" onClose={() => { if (!deleting) setDelTarget(null) }}>
           <p className="break-all font-mono text-[12px] text-fog">{delTarget.name}</p>
           <p className="mt-1 text-[13px] text-fog">The encrypted block is overwritten on disk. No way back.</p>
           <div className="mt-4 flex gap-2">
-            <button onClick={doDelete} className="btn flex-1 rounded-lg bg-rust px-4 py-2 text-[13px] font-semibold text-white hover:brightness-110">Delete</button>
-            <button onClick={() => setDelTarget(null)} className="btn flex-1 rounded-lg border border-line px-4 py-2 text-[13px]">Cancel</button>
+            <button disabled={deleting} onClick={doDelete} className="btn flex-1 rounded-lg bg-rust px-4 py-2 text-[13px] font-semibold text-white hover:brightness-110 disabled:opacity-50">{deleting ? 'Deleting…' : 'Delete'}</button>
+            <button disabled={deleting} onClick={() => setDelTarget(null)} className="btn flex-1 rounded-lg border border-line px-4 py-2 text-[13px] disabled:opacity-50">Cancel</button>
+          </div>
+        </Modal>
+      )}
+      {importReport && (
+        <Modal title="Folder import report" onClose={() => setImportReport(null)} wide>
+          <p className="text-[13px] text-fog">
+            <span className="font-semibold text-stone-100">{importReport.imported}</span> files encrypted
+            {importReport.skipped.length > 0 && (
+              <>, <span className="font-semibold text-brass">{importReport.skipped.length} skipped</span></>)}
+            {importReport.emptyDirs.length > 0 && (
+              <>, <span className="text-stone-300">{importReport.emptyDirs.length} empty folders</span> (nothing to store)</>)}
+            .
+          </p>
+          {importReport.skipped.length > 0 && (
+            <div className="mt-3 max-h-[220px] overflow-y-auto rounded-lg border border-line bg-ink p-2">
+              {importReport.skipped.map((s, i) => (
+                <div key={i} className="border-b border-line/50 px-1.5 py-1.5 last:border-0">
+                  <p className="break-all font-mono text-[11px] text-stone-300">{s.path}</p>
+                  <p className="mt-0.5 text-[11px] text-brass">{s.reason}</p>
+                </div>
+              ))}
+              {importReport.skippedExtra > 0 && (
+                <p className="px-1.5 py-1 font-mono text-[11px] text-stone-500">+{importReport.skippedExtra} more skipped</p>
+              )}
+            </div>
+          )}
+          {importReport.emptyDirs.length > 0 && (
+            <p className="mt-2 break-all font-mono text-[11px] text-stone-500">
+              Empty: {importReport.emptyDirs.slice(0, 10).join(', ')}{importReport.emptyDirs.length > 10 ? '…' : ''}{importReport.emptyExtra > 0 ? ` (+${importReport.emptyExtra} more)` : ''}</p>
+          )}
+          <div className="mt-4">
+            <button onClick={() => setImportReport(null)} className="btn w-full rounded-lg bg-brass px-4 py-2 text-[13px] font-semibold text-[#1a1408] hover:bg-[#f0b45a]">Done</button>
+          </div>
+        </Modal>
+      )}
+      {pendingImport && (
+        <Modal title={`Encrypt ${pendingImport.total} files?`} onClose={() => { if (!confirming) setPendingImport(null) }} wide>
+          <p className="break-all font-mono text-[12px] text-fog">{pendingImport.root}/…</p>
+          <p className="mt-1.5 text-[13px] text-fog">
+            <span className="font-semibold text-stone-100">{pendingImport.total} files</span>
+            {' · '}{fmtSize(pendingImport.bytesTotal)} total.
+            {pendingImport.skipped.length > 0 && (
+              <> <span className="text-brass">{pendingImport.skipped.length + pendingImport.skippedExtra} won't come</span> (unreadable or too large).</>)}
+            {pendingImport.emptyDirs.length > 0 && (
+              <> {pendingImport.emptyDirs.length + pendingImport.emptyExtra} empty folders hold nothing to store.</>)}
+          </p>
+          <p className="mt-1 text-[12px] text-stone-500">Takes a while — progress shows live and Cancel keeps finished files.</p>
+          <div className="mt-4 flex gap-2">
+            <button disabled={confirming} onClick={runImportConfirm} className="btn flex-1 rounded-lg bg-brass px-4 py-2 text-[13px] font-semibold text-[#1a1408] hover:bg-[#f0b45a] disabled:opacity-50">
+              {confirming ? 'Starting…' : `Encrypt ${pendingImport.total} files`}</button>
+            <button disabled={confirming} onClick={() => setPendingImport(null)} className="btn flex-1 rounded-lg border border-line px-4 py-2 text-[13px] disabled:opacity-50">Not now</button>
           </div>
         </Modal>
       )}
@@ -834,6 +949,11 @@ export default function App() {
           </div>
         </Modal>
       )}
+
+      {previewFile && (
+        <PreviewModal file={previewFile} onClose={() => setPreviewFile(null)} onOpenExternal={(id) => { setPreviewFile(null); doOpen(id) }} />
+      )}
+      {lanOpen && <LanModal vaultDir={vaultDir} onClose={() => setLanOpen(false)} />}
     </div>
   )
 }
@@ -848,10 +968,14 @@ function IconBtn({ children, title, onClick, danger }: { children: React.ReactNo
   )
 }
 
-function Modal({ title, children, onClose }: { title: string; children: React.ReactNode; onClose: () => void }) {
+function Modal({ title, children, onClose, wide }: { title: string; children: React.ReactNode; onClose: () => void; wide?: boolean }) {
+  // Swallow the second half of an accidental double-click: the backdrop
+  // ignores clicks for a moment after opening so it can't instantly close.
+  const born = useRef(Date.now())
   return (
-    <div className="fixed inset-0 z-40 grid place-items-center bg-black/60 p-4" onClick={onClose}>
-      <div className="animate-pop w-[380px] max-w-full rounded-[10px] border border-line bg-panel p-5" onClick={(e) => e.stopPropagation()}>
+    <div className="fixed inset-0 z-40 grid place-items-center bg-black/60 p-4"
+      onClick={() => { if (Date.now() - born.current > 300) onClose() }}>
+      <div className={`animate-pop max-w-full rounded-[10px] border border-line bg-panel p-5 ${wide ? 'w-[480px]' : 'w-[380px]'}`} onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between">
           <h3 className="text-[14px] font-semibold text-stone-100">{title}</h3>
           <button onClick={onClose} className="btn rounded-md p-1 text-stone-500 hover:text-stone-200">
@@ -863,13 +987,14 @@ function Modal({ title, children, onClose }: { title: string; children: React.Re
   )
 }
 
-function Palette({ files, openIds, onClose, onOpen, onImport, onImportFolder, onLock, onPw }: {
+function Palette({ files, openIds, onClose, onOpen, onImport, onImportFolder, onLock, onPw, onLan }: {
   files: FileEntry[]; openIds: Set<string>; onClose: () => void
-  onOpen: (id: string) => void; onImport: () => void; onImportFolder: () => void; onLock: () => void; onPw: () => void
+  onOpen: (id: string) => void; onImport: () => void; onImportFolder: () => void; onLock: () => void; onPw: () => void; onLan: () => void
 }) {
   const [q, setQ] = useState('')
   const [sel, setSel] = useState(0)
   const inputRef = useRef<HTMLInputElement>(null)
+  const born = useRef(Date.now())
   useEffect(() => { inputRef.current?.focus() }, [])
 
   const fz = q.toLowerCase()
@@ -877,6 +1002,7 @@ function Palette({ files, openIds, onClose, onOpen, onImport, onImportFolder, on
   const actions = [
     { label: 'Add files', hint: 'encrypt', run: onImport },
     { label: 'Add folder', hint: 'encrypt the tree', run: onImportFolder },
+    { label: 'Phone access', hint: 'serve on LAN', run: onLan },
     { label: 'Change master password', hint: 'reseal the vault', run: onPw },
     { label: 'Lock vault', hint: 'wipe key from memory', run: onLock },
   ].filter((a) => a.label.toLocaleLowerCase('en').includes(fz))
@@ -899,7 +1025,8 @@ function Palette({ files, openIds, onClose, onOpen, onImport, onImportFolder, on
 
   let idx = -1
   return (
-    <div className="fixed inset-0 z-40 bg-black/60 p-4 pt-[14vh]" onClick={onClose}>
+    <div className="fixed inset-0 z-40 bg-black/60 p-4 pt-[14vh]"
+      onClick={() => { if (Date.now() - born.current > 300) onClose() }}>
       <div className="animate-pop mx-auto w-[560px] max-w-full overflow-hidden rounded-[10px] border border-line bg-panel shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center gap-2 border-b border-line px-3.5 transition-colors focus-within:border-brassdim">
           <Command className="h-4 w-4 shrink-0 text-fog" strokeWidth={1.75} />

@@ -14,10 +14,18 @@ declare global {
       list(): Promise<{ ok: boolean; data?: any; error?: string }>
       importFile(): Promise<{ ok: boolean; data?: any; error?: string }>
       importFolder(): Promise<{ ok: boolean; data?: any; error?: string }>
+      confirmImportFolder(): Promise<{ ok: boolean; data?: any; error?: string }>
       cancelImport(): Promise<{ ok: boolean; data?: any; error?: string }>
       exportFolder(prefix: string): Promise<{ ok: boolean; data?: any; error?: string }>
       deleteFolder(prefix: string): Promise<{ ok: boolean; data?: any; error?: string }>
       open(fileId: string): Promise<{ ok: boolean; data?: any; error?: string }>
+      read(fileId: string): Promise<{ ok: boolean; data?: any; error?: string }>
+      stream(fileId: string): Promise<{ ok: boolean; data?: any; error?: string }>
+      streamClose(token: string): Promise<{ ok: boolean; data?: any; error?: string }>
+      lanStart(vaultDir: string, port?: number): Promise<{ ok: boolean; data?: any; error?: string }>
+      lanStop(): Promise<{ ok: boolean; data?: any; error?: string }>
+      lanStatus(): Promise<{ ok: boolean; data?: any; error?: string }>
+      lanIps(): Promise<{ ok: boolean; data?: any; error?: string }>
       reencrypt(fileId: string): Promise<{ ok: boolean; data?: any; error?: string }>
       closeFile(fileId: string): Promise<{ ok: boolean; data?: any; error?: string }>
       remove(fileId: string): Promise<{ ok: boolean; data?: any; error?: string }>

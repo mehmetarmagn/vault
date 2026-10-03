@@ -13,6 +13,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,6 +47,8 @@ type Request struct {
 	Name        string `json:"name,omitempty"`
 	FileID      string `json:"fileId,omitempty"`
 	Prefix      string `json:"prefix,omitempty"`
+	Token       string `json:"token,omitempty"`
+	Port        int    `json:"port,omitempty"`
 }
 
 type Response struct {
@@ -383,16 +387,46 @@ func guessMime(name string) string {
 		return "image/jpeg"
 	case ".gif":
 		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".svg":
+		return "image/svg+xml"
+	case ".bmp":
+		return "image/bmp"
 	case ".pdf":
 		return "application/pdf"
-	case ".txt", ".md", ".go", ".js", ".ts", ".tsx", ".json", ".html", ".css", ".rs", ".py", ".yml", ".yaml", ".toml", ".log":
+	case ".txt", ".md", ".go", ".js", ".ts", ".tsx", ".json", ".html", ".css", ".rs", ".py", ".yml", ".yaml", ".toml", ".log", ".xml", ".csv":
 		return "text/plain"
 	case ".mp4":
 		return "video/mp4"
+	case ".webm":
+		return "video/webm"
+	case ".mkv":
+		return "video/x-matroska"
+	case ".mov":
+		return "video/quicktime"
+	case ".avi":
+		return "video/x-msvideo"
 	case ".mp3":
 		return "audio/mpeg"
+	case ".wav":
+		return "audio/wav"
+	case ".ogg", ".oga":
+		return "audio/ogg"
+	case ".ogv":
+		return "video/ogg"
+	case ".flac":
+		return "audio/flac"
+	case ".m4a":
+		return "audio/mp4"
 	case ".zip":
 		return "application/zip"
+	case ".xlsx":
+		return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+	case ".xls":
+		return "application/vnd.ms-excel"
+	case ".docx":
+		return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 	default:
 		return "application/octet-stream"
 	}
@@ -697,9 +731,268 @@ func handleImport(req Request) {
 	succeed(req.ID, entry)
 }
 
-const (
-	MaxFolderFiles = 2000
+const MaxPreviewSize = 100 * 1024 * 1024 // in-app read cap (bigger: use stream or external open)
+
+// ---------- in-app preview: RAM-only stream server (no disk) ----------
+
+type streamEntry struct {
+	data []byte
+	mime string
+	name string
+}
+
+var (
+	streamMu      sync.Mutex
+	streams       = map[string]*streamEntry{}
+	streamBaseURL = ""
 )
+
+func ensureStreamServer() string {
+	streamMu.Lock()
+	defer streamMu.Unlock()
+	if streamBaseURL != "" {
+		return streamBaseURL
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/s/", func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.URL.Path, "/s/")
+		streamMu.Lock()
+		e, ok := streams[token]
+		streamMu.Unlock()
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		if e.mime != "" {
+			w.Header().Set("Content-Type", e.mime)
+		}
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Cache-Control", "no-store")
+		http.ServeContent(w, r, e.name, time.Now(), bytes.NewReader(e.data))
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return ""
+	}
+	go func() {
+		_ = http.Serve(ln, mux)
+	}()
+	streamBaseURL = "http://" + ln.Addr().String()
+	return streamBaseURL
+}
+
+func clearStreamsLocked() {
+	for token, e := range streams {
+		zeroBytes(e.data)
+		delete(streams, token)
+	}
+}
+
+func handleRead(req Request) {
+	sess.Lock()
+	defer sess.Unlock()
+	if !sess.unlocked {
+		fail(req.ID, "locked")
+		return
+	}
+	var entry *FileEntry
+	for i := range sess.index.Files {
+		if sess.index.Files[i].ID == req.FileID {
+			entry = &sess.index.Files[i]
+			break
+		}
+	}
+	if entry == nil {
+		fail(req.ID, "file not found")
+		return
+	}
+	raw, err := os.ReadFile(blobPath(sess.vaultDir, entry.ID))
+	if err != nil {
+		fail(req.ID, err.Error())
+		return
+	}
+	plain, err := decryptBlobToPlain(sess.key, raw, entry.ID)
+	if err != nil {
+		fail(req.ID, "decryption failed")
+		return
+	}
+	defer zeroBytes(plain)
+	if int64(len(plain)) > MaxPreviewSize {
+		fail(req.ID, "too large for in-app preview (use open or stream)")
+		return
+	}
+	succeed(req.ID, map[string]any{
+		"name": entry.Name, "mime": entry.Mime, "size": len(plain),
+		"b64": base64.StdEncoding.EncodeToString(plain),
+	})
+}
+
+func handleStream(req Request) {
+	sess.Lock()
+	var entry *FileEntry
+	for i := range sess.index.Files {
+		if sess.index.Files[i].ID == req.FileID {
+			entry = &sess.index.Files[i]
+			break
+		}
+	}
+	if !sess.unlocked || entry == nil {
+		sess.Unlock()
+		fail(req.ID, "file not found")
+		return
+	}
+	raw, err := os.ReadFile(blobPath(sess.vaultDir, entry.ID))
+	if err != nil {
+		sess.Unlock()
+		fail(req.ID, err.Error())
+		return
+	}
+	plain, err := decryptBlobToPlain(sess.key, raw, entry.ID)
+	if err != nil {
+		sess.Unlock()
+		fail(req.ID, "decryption failed")
+		return
+	}
+	mime, name := entry.Mime, entry.Name
+	sess.Unlock()
+	base := ensureStreamServer()
+	if base == "" {
+		zeroBytes(plain)
+		fail(req.ID, "stream server failed")
+		return
+	}
+	token := newID()
+	streamMu.Lock()
+	streams[token] = &streamEntry{data: plain, mime: mime, name: name}
+	streamMu.Unlock()
+	succeed(req.ID, map[string]any{
+		"url": base + "/s/" + token, "token": token, "mime": mime,
+		"name": name, "size": len(plain),
+	})
+}
+
+func handleStreamClose(req Request) {
+	streamMu.Lock()
+	defer streamMu.Unlock()
+	if req.Token != "" {
+		if e, ok := streams[req.Token]; ok {
+			zeroBytes(e.data)
+			delete(streams, req.Token)
+		}
+	}
+	succeed(req.ID, map[string]bool{"closed": true})
+}
+
+// folder scan: follows file symlinks and dir junctions, guards link loops,
+// reports skipped files AND empty dirs (a vault stores files, not folders).
+type importJob struct {
+	path  string
+	name  string
+	mime  string
+	mtime string
+	size  int64
+}
+
+// scan reports are capped so a monster tree can't flood the IPC channel;
+// the overflow lands in skippedExtra / emptyExtra.
+const maxScanReport = 500
+
+func scanImportTree(root, base string) (jobs []importJob, skipped []map[string]string, skippedExtra int, emptyDirs []string, emptyExtra int) {
+	visited := map[string]bool{} // canonical dir -> seen (link loop guard)
+	hasFiles := map[string]bool{}
+	var allDirs []string
+	addSkipped := func(path, reason string) {
+		if len(skipped) < maxScanReport {
+			skipped = append(skipped, map[string]string{"path": path, "reason": reason})
+		} else {
+			skippedExtra++
+		}
+	}
+	canon := func(dir string) string {
+		if c, err := filepath.EvalSymlinks(dir); err == nil {
+			return c
+		}
+		if abs, err := filepath.Abs(dir); err == nil {
+			return abs
+		}
+		return dir
+	}
+	markTree := func(logical string) {
+		for p := logical; ; {
+			hasFiles[p] = true
+			i := strings.LastIndex(p, "/")
+			if i < 0 {
+				break
+			}
+			p = p[:i]
+		}
+	}
+	var rec func(dir, logical string)
+	rec = func(dir, logical string) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			addSkipped(dir, err.Error())
+			return
+		}
+		c := canon(dir)
+		if visited[c] {
+			addSkipped(dir, "already visited (link loop), skipped")
+			return
+		}
+		visited[c] = true
+		allDirs = append(allDirs, logical)
+		for _, e := range entries {
+			full := filepath.Join(dir, e.Name())
+			vname := logical + "/" + e.Name()
+			info, err := e.Info()
+			if err != nil {
+				addSkipped(full, err.Error())
+				continue
+			}
+			if info.IsDir() {
+				rec(full, vname)
+				continue
+			}
+			var fi os.FileInfo
+			if info.Mode().IsRegular() {
+				fi = info
+			} else if st, err := os.Stat(full); err != nil {
+				// broken link (or unreadable reparse point)
+				addSkipped(full, "unreadable link target: "+err.Error())
+				continue
+			} else if st.IsDir() {
+				// junction / dir symlink: descend, logical name preserved
+				rec(full, vname)
+				continue
+			} else if !st.Mode().IsRegular() {
+				addSkipped(full, "not a regular file")
+				continue
+			} else {
+				fi = st // file symlink: seal the target's content
+			}
+			if fi.Size() > MaxFileSize {
+				addSkipped(full, "file too large (500MB limit)")
+				continue
+			}
+			jobs = append(jobs, importJob{
+				path: full, name: vname, mime: guessMime(full),
+				mtime: fi.ModTime().UTC().Format(time.RFC3339), size: fi.Size(),
+			})
+			markTree(logical)
+		}
+	}
+	rec(root, base)
+	for _, d := range allDirs {
+		if !hasFiles[d] {
+			if len(emptyDirs) < maxScanReport {
+				emptyDirs = append(emptyDirs, d)
+			} else {
+				emptyExtra++
+			}
+		}
+	}
+	return jobs, skipped, skippedExtra, emptyDirs, emptyExtra
+}
 
 // folder prefix match: "proj" == name or name starts with "proj/..."
 func matchPrefix(name, prefix string) bool {
@@ -707,6 +1000,40 @@ func matchPrefix(name, prefix string) bool {
 		return false
 	}
 	return name == prefix || strings.HasPrefix(name, prefix+"/")
+}
+
+func handleScanFolder(req Request) {
+	sess.Lock()
+	unlocked := sess.unlocked
+	sess.Unlock()
+	if !unlocked {
+		fail(req.ID, "locked")
+		return
+	}
+	if req.Path == "" {
+		fail(req.ID, "path required")
+		return
+	}
+	st, err := os.Stat(req.Path)
+	if err != nil {
+		fail(req.ID, err.Error())
+		return
+	}
+	if !st.IsDir() {
+		fail(req.ID, "not a folder, use import for files")
+		return
+	}
+	base := filepath.Base(req.Path)
+	jobs, skipped, skippedExtra, emptyDirs, emptyExtra := scanImportTree(req.Path, base)
+	var bytesTotal int64
+	for _, j := range jobs {
+		bytesTotal += j.size
+	}
+	succeed(req.ID, map[string]any{
+		"root": base, "total": len(jobs), "bytesTotal": bytesTotal,
+		"skipped": skipped, "skippedExtra": skippedExtra,
+		"emptyDirs": emptyDirs, "emptyExtra": emptyExtra,
+	})
 }
 
 func handleImportFolder(req Request) {
@@ -735,56 +1062,17 @@ func handleImportFolder(req Request) {
 	sendEvent("import-progress", map[string]any{"op": "import", "phase": "scan", "root": base})
 
 	// phase 1: scan, build the job list (lock released — disk reads only)
-	type job struct {
-		path  string
-		name  string
-		mime  string
-		mtime string
-		size  int64
-	}
 	sess.Unlock()
-	var jobs []job
-	var skipped []map[string]string
-	truncated := false
-	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, werr error) error {
-		if werr != nil {
-			skipped = append(skipped, map[string]string{"path": p, "reason": werr.Error()})
-			return nil
-		}
-		if d.IsDir() || !d.Type().IsRegular() {
-			return nil
-		}
-		if len(jobs) >= MaxFolderFiles {
-			truncated = true
-			return filepath.SkipAll
-		}
-		info, err := d.Info()
-		if err != nil {
-			skipped = append(skipped, map[string]string{"path": p, "reason": err.Error()})
-			return nil
-		}
-		if info.Size() > MaxFileSize {
-			skipped = append(skipped, map[string]string{"path": p, "reason": "file too large (500MB limit)"})
-			return nil
-		}
-		rel, err := filepath.Rel(root, p)
-		if err != nil {
-			skipped = append(skipped, map[string]string{"path": p, "reason": err.Error()})
-			return nil
-		}
-		name := filepath.ToSlash(filepath.Join(base, rel))
-		jobs = append(jobs, job{
-			path: p, name: name, mime: guessMime(p),
-			mtime: info.ModTime().UTC().Format(time.RFC3339), size: info.Size(),
-		})
-		return nil
-	})
+	jobs, skipped, skippedExtra, emptyDirs, emptyExtra := scanImportTree(root, base)
 	sess.Lock()
-	if truncated {
-		skipped = append(skipped, map[string]string{"path": root, "reason": "folder limit exceeded (2000 files)"})
-	}
 	if !sess.unlocked {
 		fail(req.ID, "locked")
+		return
+	}
+	if importCancel.Load() {
+		// cancelled during scan: nothing sealed, nothing committed
+		// (lock is held here; the deferred Unlock releases it)
+		succeed(req.ID, map[string]any{"imported": []FileEntry{}, "skipped": skipped, "skippedExtra": skippedExtra, "emptyDirs": emptyDirs, "emptyExtra": emptyExtra, "cancelled": true})
 		return
 	}
 	var bytesTotal int64
@@ -796,6 +1084,8 @@ func handleImportFolder(req Request) {
 		reason := "no importable files in folder"
 		if len(skipped) > 0 {
 			reason = skipped[0]["reason"]
+		} else if len(emptyDirs) > 0 {
+			reason = fmt.Sprintf("%d empty folder(s) — the vault stores files, not empty folders", len(emptyDirs))
 		}
 		fail(req.ID, "nothing imported: "+reason)
 		return
@@ -884,7 +1174,7 @@ func handleImportFolder(req Request) {
 		"bytesDone": bytesDone, "bytesTotal": bytesTotal,
 		"cancelled": cancelled,
 	})
-	succeed(req.ID, map[string]any{"imported": imported, "skipped": skipped, "cancelled": cancelled})
+	succeed(req.ID, map[string]any{"imported": imported, "skipped": skipped, "skippedExtra": skippedExtra, "emptyDirs": emptyDirs, "emptyExtra": emptyExtra, "cancelled": cancelled})
 }
 
 func handleCancelImport(req Request) {
@@ -995,7 +1285,7 @@ func handleDeleteFolder(req Request) {
 	}
 	type target struct {
 		id, name string
-		size    int64
+		size     int64
 	}
 	var targets []target
 	var bytesTotal int64
@@ -1006,7 +1296,8 @@ func handleDeleteFolder(req Request) {
 		}
 	}
 	if len(targets) == 0 {
-		fail(req.ID, "folder not found")
+		sess.Unlock()
+		succeed(req.ID, map[string]any{"deleted": 0, "note": "already gone"})
 		return
 	}
 	importCancel.Store(false)
@@ -1200,25 +1491,36 @@ func handleClose(req Request) {
 }
 
 func handleDelete(req Request) {
+	// commit-then-wipe: the index updates under a short lock, the slow
+	// overwrite runs unlocked so list/status never freeze behind a delete.
 	sess.Lock()
-	defer sess.Unlock()
 	if !sess.unlocked {
+		sess.Unlock()
 		fail(req.ID, "locked")
 		return
 	}
+	found := false
+	for _, f := range sess.index.Files {
+		if f.ID == req.FileID {
+			found = true
+			break
+		}
+	}
+	var tempPath string
 	if o, ok := sess.open[req.FileID]; ok {
 		select {
 		case <-o.stopCh:
 		default:
 			close(o.stopCh)
 		}
-		secureWipe(o.tempPath)
+		tempPath = o.tempPath
 		delete(sess.open, req.FileID)
 	}
-	// wipe the blob by overwriting
-	bp := blobPath(sess.vaultDir, req.FileID)
-	wipeFileContents(bp)
-	_ = os.Remove(bp)
+	if !found && tempPath == "" {
+		sess.Unlock()
+		succeed(req.ID, map[string]string{"deleted": req.FileID, "note": "already gone"})
+		return
+	}
 	kept := sess.index.Files[:0]
 	for _, f := range sess.index.Files {
 		if f.ID != req.FileID {
@@ -1226,7 +1528,19 @@ func handleDelete(req Request) {
 		}
 	}
 	sess.index.Files = kept
-	_ = writeIndexLocked()
+	werr := writeIndexLocked()
+	vaultDir := sess.vaultDir
+	sess.Unlock()
+	if werr != nil {
+		fail(req.ID, werr.Error())
+		return
+	}
+	if tempPath != "" {
+		secureWipe(tempPath)
+	}
+	bp := blobPath(vaultDir, req.FileID)
+	wipeFileContents(bp)
+	_ = os.Remove(bp)
 	succeed(req.ID, map[string]string{"deleted": req.FileID})
 }
 
@@ -1377,10 +1691,378 @@ func handleLock(req Request) {
 	sess.unlocked = false
 	sess.vaultDir = ""
 	sess.Unlock()
+	clearStreamsLocked()
+	clearLanTokens()
 	for _, t := range openTemps {
 		secureWipe(t)
 	}
 	succeed(req.ID, map[string]bool{"locked": true})
+}
+
+// ---------- LAN access: phone on the same Wi-Fi, port 6767 ----------
+// Serves a small mobile page + JSON API on 0.0.0.0. Login uses the vault
+// password (same verifier as unlock). Tokens live 24h, 5 wrong tries = 60s block.
+
+type lanState struct {
+	sync.Mutex
+	running    bool
+	port       int
+	vaultDir   string
+	srv        *http.Server
+	ln         net.Listener
+	tokens     map[string]time.Time
+	failCount  int
+	blockUntil time.Time
+}
+
+var lan = lanState{tokens: map[string]time.Time{}}
+
+const lanTokenTTL = 24 * time.Hour
+
+func clearLanTokens() {
+	lan.Lock()
+	defer lan.Unlock()
+	for t := range lan.tokens {
+		delete(lan.tokens, t)
+	}
+	lan.failCount = 0
+	lan.blockUntil = time.Time{}
+}
+
+func lanCheckToken(r *http.Request) bool {
+	tok := r.URL.Query().Get("token")
+	if tok == "" {
+		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+			tok = strings.TrimPrefix(h, "Bearer ")
+		}
+	}
+	if tok == "" {
+		return false
+	}
+	lan.Lock()
+	defer lan.Unlock()
+	exp, ok := lan.tokens[tok]
+	if !ok || time.Now().After(exp) {
+		delete(lan.tokens, tok)
+		return false
+	}
+	return true
+}
+
+func lanWriteJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// verify password against a vault dir without touching the live session
+func lanVerifyPassword(vaultDir, password string) ([]byte, error) {
+	metaBytes, err := os.ReadFile(metaPath(vaultDir))
+	if err != nil {
+		return nil, fmt.Errorf("vault not found")
+	}
+	var meta Meta
+	if err := json.Unmarshal(metaBytes, &meta); err != nil {
+		return nil, fmt.Errorf("corrupt meta")
+	}
+	key, err := deriveKey(password, meta.KDF)
+	if err != nil {
+		return nil, err
+	}
+	nonce, _ := base64.StdEncoding.DecodeString(meta.Verify.NonceB64)
+	ct, _ := base64.StdEncoding.DecodeString(meta.Verify.CtB64)
+	aead, _ := aeadFor(key)
+	plain, err := aead.Open(nil, nonce, ct, nil)
+	if err != nil || string(plain) != verifierString(meta.VaultID) {
+		zeroBytes(plain)
+		zeroBytes(key)
+		return nil, fmt.Errorf("invalid-password")
+	}
+	zeroBytes(plain)
+	return key, nil
+}
+
+func lanHandleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		lanWriteJSON(w, 405, map[string]string{"error": "method not allowed"})
+		return
+	}
+	lan.Lock()
+	blocked := time.Now().Before(lan.blockUntil)
+	lan.Unlock()
+	if blocked {
+		lanWriteJSON(w, 429, map[string]string{"error": "too many tries, wait a minute"})
+		return
+	}
+	var body struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&body); err != nil {
+		lanWriteJSON(w, 400, map[string]string{"error": "bad request"})
+		return
+	}
+	lan.Lock()
+	vaultDir := lan.vaultDir
+	lan.Unlock()
+	key, err := lanVerifyPassword(vaultDir, body.Password)
+	if err != nil {
+		lan.Lock()
+		lan.failCount++
+		if lan.failCount >= 5 {
+			lan.blockUntil = time.Now().Add(time.Minute)
+			lan.failCount = 0
+		}
+		lan.Unlock()
+		lanWriteJSON(w, 401, map[string]string{"error": "invalid-password"})
+		return
+	}
+	// success: unlock the live session too (same key as desktop unlock)
+	sess.Lock()
+	if sess.key != nil {
+		zeroBytes(sess.key)
+	}
+	sess.vaultDir = vaultDir
+	sess.key = key
+	sess.unlocked = true
+	_ = readIndexLocked()
+	n := len(sess.index.Files)
+	sess.Unlock()
+	tok := newID()
+	lan.Lock()
+	lan.tokens[tok] = time.Now().Add(lanTokenTTL)
+	lan.failCount = 0
+	// prune expired
+	for t, exp := range lan.tokens {
+		if time.Now().After(exp) {
+			delete(lan.tokens, t)
+		}
+	}
+	lan.Unlock()
+	sendEvent("lan-login", map[string]any{"files": n})
+	lanWriteJSON(w, 200, map[string]any{"token": tok, "files": n})
+}
+
+func lanHandleFiles(w http.ResponseWriter, r *http.Request) {
+	if !lanCheckToken(r) {
+		lanWriteJSON(w, 401, map[string]string{"error": "unauthorized"})
+		return
+	}
+	sess.Lock()
+	defer sess.Unlock()
+	if !sess.unlocked {
+		lanWriteJSON(w, 401, map[string]string{"error": "locked"})
+		return
+	}
+	lanWriteJSON(w, 200, sess.index.Files)
+}
+
+func lanFindEntry(id string) *FileEntry {
+	sess.Lock()
+	defer sess.Unlock()
+	if !sess.unlocked {
+		return nil
+	}
+	for i := range sess.index.Files {
+		if sess.index.Files[i].ID == id {
+			e := sess.index.Files[i]
+			return &e
+		}
+	}
+	return nil
+}
+
+func lanDecrypt(id string) ([]byte, *FileEntry, error) {
+	e := lanFindEntry(id)
+	if e == nil {
+		return nil, nil, fmt.Errorf("not found")
+	}
+	sess.Lock()
+	raw, err := os.ReadFile(blobPath(sess.vaultDir, id))
+	key := sess.key
+	sess.Unlock()
+	if err != nil {
+		return nil, nil, err
+	}
+	plain, err := decryptBlobToPlain(key, raw, id)
+	if err != nil {
+		return nil, nil, fmt.Errorf("decryption failed")
+	}
+	return plain, e, nil
+}
+
+func lanHandleFile(w http.ResponseWriter, r *http.Request) {
+	if !lanCheckToken(r) {
+		lanWriteJSON(w, 401, map[string]string{"error": "unauthorized"})
+		return
+	}
+	plain, e, err := lanDecrypt(r.URL.Query().Get("id"))
+	if err != nil {
+		lanWriteJSON(w, 404, map[string]string{"error": err.Error()})
+		return
+	}
+	defer zeroBytes(plain)
+	if int64(len(plain)) > MaxPreviewSize {
+		lanWriteJSON(w, 413, map[string]string{"error": "too large, use stream"})
+		return
+	}
+	w.Header().Set("Content-Type", e.Mime)
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(plain)
+}
+
+func lanHandleStream(w http.ResponseWriter, r *http.Request) {
+	if !lanCheckToken(r) {
+		lanWriteJSON(w, 401, map[string]string{"error": "unauthorized"})
+		return
+	}
+	plain, e, err := lanDecrypt(r.URL.Query().Get("id"))
+	if err != nil {
+		lanWriteJSON(w, 404, map[string]string{"error": err.Error()})
+		return
+	}
+	defer zeroBytes(plain)
+	w.Header().Set("Content-Type", e.Mime)
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeContent(w, r, e.Name, time.Now(), bytes.NewReader(plain))
+}
+
+// small mobile page (no backticks inside: Go raw string + plain JS)
+const lanHome = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Secure Vault</title>
+<style>
+body{margin:0;background:#14120f;color:#e7e2d8;font-family:system-ui,sans-serif}
+.wrap{max-width:640px;margin:0 auto;padding:16px}
+h1{font-size:18px;margin:4px 0 12px}h1 span{color:#e8a33d}
+.card{background:#1c1a16;border:1px solid #2c2822;border-radius:10px;padding:14px;margin-bottom:10px}
+input{width:100%;box-sizing:border-box;background:#14120f;border:1px solid #2c2822;color:#fff;border-radius:8px;padding:10px;font-size:15px}
+button{width:100%;background:#e8a33d;border:0;border-radius:8px;padding:11px;font-size:15px;font-weight:700;margin-top:10px}
+.row{display:flex;gap:8px;align-items:center;padding:10px 4px;border-bottom:1px solid #2c2822;font-size:14px}
+.row .n{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .s{color:#8a8578;font-size:11px;font-family:monospace}
+#pv img,#pv video,#pv audio{max-width:100%;border-radius:8px}
+#pv iframe{width:100%;height:70vh;border:0;border-radius:8px;background:#fff}
+#pv pre{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto}
+.err{color:#e0684e;font-size:13px;min-height:18px}
+.hide{display:none}
+.back{background:#2c2822;color:#fff;margin-bottom:8px}
+</style></head><body><div class="wrap">
+<h1><span>Secure</span> Vault</h1>
+<div id="login" class="card">
+<div class="err" id="le"></div>
+<input id="pw" type="password" placeholder="Vault password" autocomplete="off">
+<button onclick="login()">Unlock</button>
+</div>
+<div id="main" class="hide">
+<div class="card"><button class="back" onclick="showList()">&larr; Files</button><div id="pv"></div></div>
+<div class="card" id="list"></div>
+</div></div>
+<script>
+var TOK='';
+function api(p,o){o=o||{};o.headers={'Content-Type':'application/json'};return fetch(p,o).then(function(r){return r.json().then(function(j){return{st:r.status,j:j}})})}
+function login(){var p=document.getElementById('pw').value;api('/api/login',{method:'POST',body:JSON.stringify({password:p})}).then(function(r){if(r.st===200&&r.j.token){TOK=r.j.token;document.getElementById('login').className='hide';document.getElementById('main').className='';load()}else{document.getElementById('le').textContent=(r.j&&r.j.error)||'login failed'}})}
+function sz(b){if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+' KB';if(b<1073741824)return (b/1048576).toFixed(1)+' MB';return (b/1073741824).toFixed(2)+' GB'}
+function load(){fetch('/api/files?token='+TOK).then(function(r){return r.json()}).then(function(fs){var h='';for(var i=0;i<fs.length;i++){var f=fs[i];h+='<div class="row" onclick="view(\''+f.id+'\')"><span class="n">'+f.name.replace(/</g,'&lt;')+'</span><span class="s">'+sz(f.size)+'</span></div>'}document.getElementById('list').innerHTML=h||'empty';showList()})}
+var CUR=[];
+function view(id){fetch('/api/files?token='+TOK).then(function(r){return r.json()}).then(function(fs){CUR=fs;var f=null;for(var i=0;i<fs.length;i++){if(fs[i].id===id)f=fs[i]}if(!f)return;var pv=document.getElementById('pv');var u='/api/stream?id='+id+'&token='+TOK;var m=f.mime||'';var html='';if(m.indexOf('image/')===0){html='<img src="'+u+'">'}else if(m.indexOf('video/')===0){html='<video src="'+u+'" controls playsinline style="width:100%">'}else if(m.indexOf('audio/')===0){html='<audio src="'+u+'" controls style="width:100%">'}else if(m==='application/pdf'){html='<iframe src="'+u+'">'}else if(m.indexOf('text/')===0){fetch('/api/file?id='+id+'&token='+TOK).then(function(r){return r.text()}).then(function(t){pv.innerHTML='<pre>'+t.replace(/</g,'&lt;').slice(0,200000)+'</pre>'})}else{html='<a style="color:#e8a33d" href="'+u+'">Download '+f.name.replace(/</g,'&lt;')+'</a>'}if(html)pv.innerHTML=html;document.getElementById('list').className='hide';pv.parentElement.className='card'})}
+function showList(){document.getElementById('list').className='card';document.getElementById('pv').innerHTML=''}
+document.getElementById('pw').addEventListener('keydown',function(e){if(e.key==='Enter')login()});
+</script></body></html>`
+
+func handleLanStart(req Request) {
+	lan.Lock()
+	if lan.running {
+		port := lan.port
+		lan.Unlock()
+		succeed(req.ID, map[string]any{"running": true, "port": port})
+		return
+	}
+	port := req.Port
+	if port <= 0 || port > 65535 {
+		port = 6767
+	}
+	vaultDir := req.VaultDir
+	if vaultDir == "" {
+		sess.Lock()
+		vaultDir = sess.vaultDir
+		sess.Unlock()
+	}
+	if vaultDir == "" {
+		lan.Unlock()
+		fail(req.ID, "unlock the vault on desktop first")
+		return
+	}
+	if _, err := os.Stat(metaPath(vaultDir)); err != nil {
+		lan.Unlock()
+		fail(req.ID, "vault not found")
+		return
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write([]byte(lanHome))
+	})
+	mux.HandleFunc("/api/login", lanHandleLogin)
+	mux.HandleFunc("/api/files", lanHandleFiles)
+	mux.HandleFunc("/api/file", lanHandleFile)
+	mux.HandleFunc("/api/stream", lanHandleStream)
+	ln, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
+	if err != nil {
+		lan.Unlock()
+		fail(req.ID, "port busy: "+err.Error())
+		return
+	}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	lan.running = true
+	lan.port = port
+	lan.vaultDir = vaultDir
+	lan.ln = ln
+	lan.srv = srv
+	lan.Unlock()
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+	sendEvent("lan-started", map[string]any{"port": port})
+	succeed(req.ID, map[string]any{"running": true, "port": port})
+}
+
+func handleLanStop(req Request) {
+	lan.Lock()
+	srv, ln := lan.srv, lan.ln
+	lan.running = false
+	lan.srv = nil
+	lan.ln = nil
+	for t := range lan.tokens {
+		delete(lan.tokens, t)
+	}
+	lan.Unlock()
+	if srv != nil {
+		_ = srv.Close()
+	}
+	if ln != nil {
+		_ = ln.Close()
+	}
+	sendEvent("lan-stopped", map[string]any{})
+	succeed(req.ID, map[string]bool{"running": false})
+}
+
+func handleLanStatus(req Request) {
+	lan.Lock()
+	defer lan.Unlock()
+	n := 0
+	for _, exp := range lan.tokens {
+		if time.Now().Before(exp) {
+			n++
+		}
+	}
+	succeed(req.ID, map[string]any{"running": lan.running, "port": lan.port, "sessions": n})
 }
 
 func serve() {
@@ -1422,10 +2104,18 @@ func dispatch(req Request) {
 		handleImport(req)
 	case "import-folder":
 		handleImportFolder(req)
+	case "scan-folder":
+		handleScanFolder(req)
 	case "cancel-import":
 		handleCancelImport(req)
 	case "open":
 		handleOpen(req)
+	case "read":
+		handleRead(req)
+	case "stream":
+		handleStream(req)
+	case "stream-close":
+		handleStreamClose(req)
 	case "reencrypt":
 		handleReencrypt(req)
 	case "close":
@@ -1442,6 +2132,12 @@ func dispatch(req Request) {
 		handleExportFolder(req)
 	case "change-password":
 		handleChangePassword(req)
+	case "lan-start":
+		handleLanStart(req)
+	case "lan-stop":
+		handleLanStop(req)
+	case "lan-status":
+		handleLanStatus(req)
 	case "lock":
 		handleLock(req)
 	case "ping":

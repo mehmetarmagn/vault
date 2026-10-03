@@ -110,6 +110,9 @@ function createWindow() {
   } else {
     win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
   }
+  // Keep the decrypted view out of screenshots / screen share thumbnails
+  // where the OS allows it. Kernel-level capture tools can still see it.
+  try { win.setContentProtection(true); } catch {}
 }
 
 app.whenReady().then(() => {
@@ -139,10 +142,20 @@ app.whenReady().then(() => {
     for (const p of r.filePaths) results.push(await callGo({ cmd: 'import', path: p }, 1800000));
     return { ok: true, data: results };
   });
+  // Folder import is scan-then-confirm: dialog + scan here, the renderer
+  // decides (large folder => "are you sure?"), confirm imports the stashed path.
+  let pendingImportPath = null;
   ipcMain.handle('vault:import-folder', async () => {
     const r = await dialog.showOpenDialog(win, { properties: ['openDirectory'] });
     if (r.canceled || !r.filePaths.length) return { ok: true, data: { skipped: true } };
-    return callGo({ cmd: 'import-folder', path: r.filePaths[0] }, 1800000);
+    pendingImportPath = r.filePaths[0];
+    return callGo({ cmd: 'scan-folder', path: pendingImportPath }, 600000);
+  });
+  ipcMain.handle('vault:import-folder-confirm', async () => {
+    if (!pendingImportPath) return { ok: false, error: 'nothing to confirm' };
+    const p = pendingImportPath;
+    pendingImportPath = null;
+    return callGo({ cmd: 'import-folder', path: p }, 1800000);
   });
   ipcMain.handle('vault:cancel-import', async () => callGo({ cmd: 'cancel-import' }));
   ipcMain.handle('vault:export-folder', async (_e, { prefix }) => {
@@ -159,6 +172,24 @@ app.whenReady().then(() => {
     return res;
   });
   ipcMain.handle('vault:reencrypt', async (_e, { fileId }) => callGo({ cmd: 'reencrypt', fileId }, 600000));
+  ipcMain.handle('vault:read', async (_e, { fileId }) => callGo({ cmd: 'read', fileId }, 600000));
+  ipcMain.handle('vault:stream', async (_e, { fileId }) => callGo({ cmd: 'stream', fileId }, 600000));
+  ipcMain.handle('vault:stream-close', async (_e, { token }) => callGo({ cmd: 'stream-close', token }));
+  ipcMain.handle('vault:lan-start', async (_e, { vaultDir, port }) => callGo({ cmd: 'lan-start', vaultDir: resolveVaultDir(vaultDir), port: port || 6767 }));
+  ipcMain.handle('vault:lan-stop', async () => callGo({ cmd: 'lan-stop' }));
+  ipcMain.handle('vault:lan-status', async () => callGo({ cmd: 'lan-status' }));
+  ipcMain.handle('vault:lan-ips', async () => {
+    const { networkInterfaces } = require('os');
+    const out = [];
+    try {
+      for (const list of Object.values(networkInterfaces())) {
+        for (const ni of list || []) {
+          if (ni && ni.family === 'IPv4' && !ni.internal && ni.address) out.push(ni.address);
+        }
+      }
+    } catch {}
+    return { ok: true, data: { ips: [...new Set(out)] } };
+  });
   ipcMain.handle('vault:close', async (_e, { fileId }) => callGo({ cmd: 'close', fileId }));
   ipcMain.handle('vault:delete', async (_e, { fileId }) => callGo({ cmd: 'delete', fileId }, 600000));
   ipcMain.handle('vault:rename', async (_e, { fileId, name }) => callGo({ cmd: 'rename', fileId, name }));
